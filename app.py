@@ -1,4 +1,3 @@
-
 from pathlib import Path
 from collections import Counter, defaultdict
 
@@ -209,7 +208,7 @@ def tabla_frecuencias(numeros):
     return pd.DataFrame(filas)
 
 
-st.title("🎯 TRIS Predictor V3")
+st.title("🎯 TRIS Predictor V4")
 st.caption("Analizador estadístico de Directa 4 usando tu histórico descargado.")
 
 archivo_subido = st.sidebar.file_uploader(
@@ -250,8 +249,13 @@ m1.metric("Resultados cargados", f"{len(datos):,}")
 m2.metric("Primera fecha", primera_fecha.strftime("%d/%m/%Y"))
 m3.metric("Última fecha", ultima_fecha.strftime("%d/%m/%Y"))
 
-tab_prediccion, tab_analisis, tab_base = st.tabs(
-    ["🎯 Ranking Directa 4", "📊 Análisis", "🗂️ Base de datos"]
+tab_prediccion, tab_backtest, tab_analisis, tab_base = st.tabs(
+    [
+        "🎯 Ranking Directa 4",
+        "🧪 Backtesting",
+        "📊 Análisis",
+        "🗂️ Base de datos",
+    ]
 )
 
 with tab_prediccion:
@@ -325,6 +329,179 @@ with tab_prediccion:
             "La puntuación sirve para ordenar patrones históricos. "
             "No es una probabilidad real ni garantiza un resultado."
         )
+
+
+with tab_backtest:
+    st.subheader("Prueba histórica del algoritmo")
+    st.write(
+        "Oculta cada resultado real, genera un Top 100 usando solamente "
+        "los sorteos anteriores y revisa si el ganador habría aparecido."
+    )
+
+    bt1, bt2, bt3 = st.columns(3)
+    sorteo_bt = bt1.selectbox(
+        "Sorteo",
+        SORTEOS,
+        key="sorteo_backtest",
+    )
+    lado_bt = bt2.selectbox(
+        "Directa 4",
+        ["Últimos 4", "Primeros 4"],
+        key="lado_backtest",
+    )
+    pruebas_bt = bt3.slider(
+        "Últimos sorteos a probar",
+        10,
+        100,
+        30,
+        10,
+        help="Empieza con 30. Una prueba grande tardará más.",
+    )
+
+    bt4, bt5 = st.columns(2)
+    ventana_bt = bt4.slider(
+        "Resultados recientes con mayor peso",
+        20,
+        500,
+        150,
+        10,
+        key="ventana_backtest",
+    )
+    recencia_bt = bt5.slider(
+        "Peso de resultados recientes",
+        0.0,
+        3.0,
+        1.5,
+        0.1,
+        key="recencia_backtest",
+    )
+
+    if st.button(
+        "▶ Ejecutar backtesting",
+        type="primary",
+        use_container_width=True,
+    ):
+        filtrados_bt = (
+            datos[datos["sorteo"] == sorteo_bt]
+            .sort_values("fecha")
+            .reset_index(drop=True)
+        )
+        numeros_bt = preparar_directa4(filtrados_bt, lado_bt)
+        fechas_bt = filtrados_bt["fecha"].tolist()
+
+        if len(numeros_bt) < pruebas_bt + 200:
+            st.error("No hay suficientes resultados para esta prueba.")
+        else:
+            inicio = len(numeros_bt) - pruebas_bt
+            barra = st.progress(0)
+            estado = st.empty()
+            filas_bt = []
+
+            for contador, indice in enumerate(
+                range(inicio, len(numeros_bt)),
+                start=1,
+            ):
+                entrenamiento = numeros_bt[:indice]
+                numero_real = numeros_bt[indice]
+
+                ranking_bt = calcular_ranking(
+                    entrenamiento,
+                    top_n=100,
+                    ventana_reciente=ventana_bt,
+                    peso_recencia=recencia_bt,
+                    excluir_vistos=False,
+                )
+
+                lista_top100 = ranking_bt["Número"].tolist()
+                posicion_real = (
+                    lista_top100.index(numero_real) + 1
+                    if numero_real in lista_top100
+                    else None
+                )
+
+                filas_bt.append(
+                    {
+                        "Fecha": fechas_bt[indice],
+                        "Resultado real": numero_real,
+                        "Ranking": posicion_real if posicion_real else "Fuera del Top 100",
+                        "Top 10": posicion_real is not None and posicion_real <= 10,
+                        "Top 20": posicion_real is not None and posicion_real <= 20,
+                        "Top 50": posicion_real is not None and posicion_real <= 50,
+                        "Top 100": posicion_real is not None,
+                    }
+                )
+
+                barra.progress(contador / pruebas_bt)
+                estado.write(
+                    f"Probando {contador} de {pruebas_bt}: "
+                    f"{pd.to_datetime(fechas_bt[indice]).strftime('%d/%m/%Y')}"
+                )
+
+            barra.empty()
+            estado.empty()
+
+            resultado_bt = pd.DataFrame(filas_bt)
+            st.session_state["resultado_backtest"] = resultado_bt
+
+    if "resultado_backtest" in st.session_state:
+        resultado_bt = st.session_state["resultado_backtest"]
+        total_bt = len(resultado_bt)
+
+        aciertos10 = int(resultado_bt["Top 10"].sum())
+        aciertos20 = int(resultado_bt["Top 20"].sum())
+        aciertos50 = int(resultado_bt["Top 50"].sum())
+        aciertos100 = int(resultado_bt["Top 100"].sum())
+
+        r1, r2, r3, r4 = st.columns(4)
+        r1.metric(
+            "Aciertos Top 10",
+            f"{aciertos10}/{total_bt}",
+            f"{aciertos10 / total_bt * 100:.1f}%",
+        )
+        r2.metric(
+            "Aciertos Top 20",
+            f"{aciertos20}/{total_bt}",
+            f"{aciertos20 / total_bt * 100:.1f}%",
+        )
+        r3.metric(
+            "Aciertos Top 50",
+            f"{aciertos50}/{total_bt}",
+            f"{aciertos50 / total_bt * 100:.1f}%",
+        )
+        r4.metric(
+            "Aciertos Top 100",
+            f"{aciertos100}/{total_bt}",
+            f"{aciertos100 / total_bt * 100:.1f}%",
+        )
+
+        st.caption(
+            "Como referencia, un Top 100 elegido completamente al azar "
+            "cubriría aproximadamente 1% de las 10,000 combinaciones."
+        )
+
+        if aciertos100 / total_bt > 0.01:
+            st.success(
+                "En esta muestra, el Top 100 superó la referencia aleatoria del 1%."
+            )
+        else:
+            st.warning(
+                "En esta muestra, el Top 100 no superó claramente "
+                "la referencia aleatoria del 1%."
+            )
+
+        st.dataframe(
+            resultado_bt.sort_values("Fecha", ascending=False),
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        st.download_button(
+            "Descargar backtesting CSV",
+            resultado_bt.to_csv(index=False).encode("utf-8-sig"),
+            file_name="backtesting_tris.csv",
+            mime="text/csv",
+        )
+
 
 with tab_analisis:
     c1, c2 = st.columns(2)
