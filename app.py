@@ -6,7 +6,7 @@ import pandas as pd
 import streamlit as st
 
 st.set_page_config(
-    page_title="TRIS Predictor V5",
+    page_title="TRIS Predictor V6",
     page_icon="🎯",
     layout="wide",
 )
@@ -78,6 +78,11 @@ def crear_modelo(numeros, ventana_reciente, peso_recencia):
     frecuencia_pares = [Counter() for _ in range(3)]
     transiciones = [defaultdict(Counter) for _ in range(3)]
 
+    # Aprende cómo cambia cada posición de un sorteo al siguiente.
+    siguiente_por_digito = [defaultdict(Counter) for _ in range(4)]
+    delta_por_posicion = [Counter() for _ in range(4)]
+    coincidencias_con_anterior = Counter()
+
     ultima_aparicion_numero = {}
     ultima_aparicion_digito_posicion = [
         {d: None for d in digitos}
@@ -86,6 +91,26 @@ def crear_modelo(numeros, ventana_reciente, peso_recencia):
 
     for indice, (numero, peso) in enumerate(zip(numeros, pesos_temporales)):
         ultima_aparicion_numero[numero] = indice
+
+        if indice > 0:
+            anterior = numeros[indice - 1]
+            coincidencias = 0
+
+            for posicion in range(4):
+                digito_anterior = anterior[posicion]
+                digito_actual = numero[posicion]
+
+                siguiente_por_digito[posicion][digito_anterior][digito_actual] += peso
+
+                delta = (
+                    int(digito_actual) - int(digito_anterior)
+                ) % 10
+                delta_por_posicion[posicion][str(delta)] += peso
+
+                if digito_actual == digito_anterior:
+                    coincidencias += 1
+
+            coincidencias_con_anterior[str(coincidencias)] += peso
 
         for posicion, digito in enumerate(numero):
             frecuencia_global[digito] += peso
@@ -128,6 +153,26 @@ def crear_modelo(numeros, ventana_reciente, peso_recencia):
             normalizar_diccionario(ausencias, digitos)
         )
 
+    siguiente_norm = []
+    for posicion in range(4):
+        por_digito = {}
+        for digito in digitos:
+            por_digito[digito] = normalizar_diccionario(
+                siguiente_por_digito[posicion][digito],
+                digitos,
+            )
+        siguiente_norm.append(por_digito)
+
+    delta_norm = [
+        normalizar_diccionario(contador, digitos)
+        for contador in delta_por_posicion
+    ]
+
+    coincidencias_norm = normalizar_diccionario(
+        coincidencias_con_anterior,
+        [str(i) for i in range(5)],
+    )
+
     ultimo_numero = numeros[-1] if numeros else "0000"
 
     return {
@@ -139,6 +184,9 @@ def crear_modelo(numeros, ventana_reciente, peso_recencia):
         "ultima_aparicion_numero": ultima_aparicion_numero,
         "cantidad": cantidad,
         "ultimo_numero": ultimo_numero,
+        "siguiente_por_digito": siguiente_norm,
+        "delta_por_posicion": delta_norm,
+        "coincidencias_con_anterior": coincidencias_norm,
     }
 
 
@@ -184,6 +232,26 @@ def calcular_componentes(numero, modelo):
     )
     similitud_ultimo = coincidencias / 4
 
+    # Probabilidad condicional empírica:
+    # dado el dígito anterior en cada posición, qué dígito tendió a seguir.
+    influencia_ultimo = sum(
+        modelo["siguiente_por_digito"][pos][ultimo[pos]][d[pos]]
+        for pos in range(4)
+    ) / 4
+
+    # Cambios modulares observados, por ejemplo 7 -> 2 equivale a +5 módulo 10.
+    patron_delta = sum(
+        modelo["delta_por_posicion"][pos][
+            str((int(d[pos]) - int(ultimo[pos])) % 10)
+        ]
+        for pos in range(4)
+    ) / 4
+
+    # Cantidad histórica de posiciones que suelen conservarse entre sorteos.
+    patron_coincidencias = modelo["coincidencias_con_anterior"][
+        str(coincidencias)
+    ]
+
     ultima_aparicion = modelo["ultima_aparicion_numero"].get(numero)
     if ultima_aparicion is None:
         ciclo_numero = 1.0
@@ -207,6 +275,9 @@ def calcular_componentes(numero, modelo):
         "Repetición": repeticion,
         "Espejo": espejo,
         "Similitud último": similitud_ultimo,
+        "Influencia último": influencia_ultimo,
+        "Patrón delta": patron_delta,
+        "Coincidencias históricas": patron_coincidencias,
         "Suma": equilibrio_suma,
         "Paridad": equilibrio_paridad,
     }
@@ -281,6 +352,9 @@ def calcular_ranking(
         "Repetición",
         "Espejo",
         "Similitud último",
+        "Influencia último",
+        "Patrón delta",
+        "Coincidencias históricas",
         "Suma",
         "Paridad",
     ]
@@ -346,8 +420,8 @@ def ejecutar_backtesting(
     return pd.DataFrame(filas)
 
 
-st.title("🎯 TRIS Predictor V5")
-st.caption("Motor modular de puntuación y validación histórica.")
+st.title("🎯 TRIS Predictor V6")
+st.caption("Motor modular con influencia aprendida del último resultado.")
 
 archivo_subido = st.sidebar.file_uploader(
     "Cargar tris_historico.csv",
@@ -389,7 +463,10 @@ with st.sidebar.expander("⚙️ Pesos del modelo", expanded=True):
     peso_ciclo = st.slider("Ciclo del número", 0.0, 1.0, 0.10, 0.01)
     peso_repeticion = st.slider("Repetición", 0.0, 1.0, 0.03, 0.01)
     peso_espejo = st.slider("Espejo", 0.0, 1.0, 0.02, 0.01)
-    peso_similitud = st.slider("Similitud con último", 0.0, 1.0, 0.03, 0.01)
+    peso_similitud = st.slider("Similitud simple con último", 0.0, 1.0, 0.01, 0.01)
+    peso_influencia = st.slider("Influencia aprendida del último", 0.0, 1.0, 0.20, 0.01)
+    peso_delta = st.slider("Patrón de cambio por posición", 0.0, 1.0, 0.10, 0.01)
+    peso_coincidencias = st.slider("Posiciones conservadas", 0.0, 1.0, 0.05, 0.01)
     peso_suma = st.slider("Equilibrio de suma", 0.0, 1.0, 0.04, 0.01)
     peso_paridad = st.slider("Paridad", 0.0, 1.0, 0.03, 0.01)
 
@@ -403,6 +480,9 @@ pesos = {
     "Repetición": peso_repeticion,
     "Espejo": peso_espejo,
     "Similitud último": peso_similitud,
+    "Influencia último": peso_influencia,
+    "Patrón delta": peso_delta,
+    "Coincidencias históricas": peso_coincidencias,
     "Suma": peso_suma,
     "Paridad": peso_paridad,
 }
@@ -447,7 +527,7 @@ with tab_ranking:
         st.download_button(
             "Descargar ranking CSV",
             ranking.to_csv(index=False).encode("utf-8-sig"),
-            file_name="ranking_v5.csv",
+            file_name="ranking_v6.csv",
             mime="text/csv",
         )
 
@@ -506,10 +586,10 @@ with tab_backtest:
                 recencia_bt,
                 pesos,
             )
-            st.session_state["bt_v5"] = resultado
+            st.session_state["bt_v6"] = resultado
 
-    if "bt_v5" in st.session_state:
-        resultado = st.session_state["bt_v5"]
+    if "bt_v6" in st.session_state:
+        resultado = st.session_state["bt_v6"]
         total = len(resultado)
 
         a10 = int(resultado["Top 10"].sum())
@@ -537,7 +617,7 @@ with tab_backtest:
         st.download_button(
             "Descargar backtesting CSV",
             resultado.to_csv(index=False).encode("utf-8-sig"),
-            file_name="backtesting_v5.csv",
+            file_name="backtesting_v6.csv",
             mime="text/csv",
         )
 
