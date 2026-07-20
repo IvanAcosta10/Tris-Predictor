@@ -1,3 +1,4 @@
+
 from pathlib import Path
 from collections import Counter, defaultdict
 
@@ -6,7 +7,7 @@ import pandas as pd
 import streamlit as st
 
 st.set_page_config(
-    page_title="TRIS Predictor V6",
+    page_title="TRIS Predictor V7",
     page_icon="🎯",
     layout="wide",
 )
@@ -295,6 +296,94 @@ def puntuar_componentes(componentes, pesos):
     return puntuacion / total_pesos
 
 
+
+def perfil_numero(numero):
+    digitos = [int(x) for x in numero]
+    pares = sum(d % 2 == 0 for d in digitos)
+    impares = 4 - pares
+    suma = sum(digitos)
+    repetidos = 4 - len(set(numero))
+    empieza_cero = numero[0] == "0"
+    consecutivos = sum(
+        abs(digitos[i] - digitos[i + 1]) == 1
+        for i in range(3)
+    )
+    altos = sum(d >= 5 for d in digitos)
+    bajos = 4 - altos
+
+    return {
+        "pares": pares,
+        "impares": impares,
+        "suma": suma,
+        "repetidos": repetidos,
+        "empieza_cero": empieza_cero,
+        "consecutivos": consecutivos,
+        "altos": altos,
+        "bajos": bajos,
+    }
+
+
+def aprender_perfil(numeros, ventana_perfil=200):
+    muestra = numeros[-min(ventana_perfil, len(numeros)):]
+    perfiles = [perfil_numero(numero) for numero in muestra]
+
+    if not perfiles:
+        return None
+
+    df = pd.DataFrame(perfiles)
+
+    conteo_pares = df["pares"].value_counts(normalize=True).to_dict()
+    conteo_repetidos = df["repetidos"].value_counts(normalize=True).to_dict()
+    conteo_altos = df["altos"].value_counts(normalize=True).to_dict()
+    conteo_consecutivos = df["consecutivos"].value_counts(normalize=True).to_dict()
+
+    suma_media = float(df["suma"].mean())
+    suma_std = float(df["suma"].std(ddof=0))
+    if suma_std == 0:
+        suma_std = 1.0
+
+    prob_cero = float(df["empieza_cero"].mean())
+
+    return {
+        "pares": conteo_pares,
+        "repetidos": conteo_repetidos,
+        "altos": conteo_altos,
+        "consecutivos": conteo_consecutivos,
+        "suma_media": suma_media,
+        "suma_std": suma_std,
+        "prob_cero": prob_cero,
+    }
+
+
+def score_perfil(numero, modelo_perfil):
+    perfil = perfil_numero(numero)
+
+    score_pares = modelo_perfil["pares"].get(perfil["pares"], 0.0)
+    score_repetidos = modelo_perfil["repetidos"].get(perfil["repetidos"], 0.0)
+    score_altos = modelo_perfil["altos"].get(perfil["altos"], 0.0)
+    score_consecutivos = modelo_perfil["consecutivos"].get(perfil["consecutivos"], 0.0)
+
+    z = abs(perfil["suma"] - modelo_perfil["suma_media"]) / modelo_perfil["suma_std"]
+    score_suma = max(0.0, 1.0 - min(z / 3.0, 1.0))
+
+    score_cero = (
+        modelo_perfil["prob_cero"]
+        if perfil["empieza_cero"]
+        else 1.0 - modelo_perfil["prob_cero"]
+    )
+
+    total = (
+        0.24 * score_pares
+        + 0.22 * score_repetidos
+        + 0.18 * score_altos
+        + 0.10 * score_consecutivos
+        + 0.20 * score_suma
+        + 0.06 * score_cero
+    )
+
+    return total, perfil
+
+
 def calcular_ranking(
     numeros,
     top_n,
@@ -302,6 +391,9 @@ def calcular_ranking(
     peso_recencia,
     pesos,
     excluir_vistos=False,
+    usar_filtro_perfil=True,
+    ventana_perfil=200,
+    porcentaje_supervivencia=5,
 ):
     if len(numeros) < 10:
         return pd.DataFrame()
@@ -315,6 +407,11 @@ def calcular_ranking(
     vistos = set(numeros)
     filas = []
 
+    modelo_perfil = aprender_perfil(
+        numeros,
+        ventana_perfil=ventana_perfil,
+    )
+
     for valor in range(10000):
         numero = f"{valor:04d}"
 
@@ -322,18 +419,46 @@ def calcular_ranking(
             continue
 
         componentes = calcular_componentes(numero, modelo)
-        puntuacion = puntuar_componentes(componentes, pesos)
+        puntuacion_base = puntuar_componentes(componentes, pesos)
+
+        if usar_filtro_perfil and modelo_perfil is not None:
+            perfil_score, perfil = score_perfil(numero, modelo_perfil)
+        else:
+            perfil_score = 1.0
+            perfil = perfil_numero(numero)
+
+        puntuacion = (
+            0.55 * puntuacion_base
+            + 0.45 * perfil_score
+        )
 
         filas.append(
             {
                 "Número": numero,
                 "Puntuación": puntuacion,
+                "Score perfil": perfil_score,
+                "Pares perfil": perfil["pares"],
+                "Suma perfil": perfil["suma"],
+                "Repetidos perfil": perfil["repetidos"],
                 **componentes,
             }
         )
 
+    df_filas = pd.DataFrame(filas)
+
+    if usar_filtro_perfil and not df_filas.empty:
+        limite = max(
+            top_n,
+            int(len(df_filas) * porcentaje_supervivencia / 100)
+        )
+        df_filas = (
+            df_filas
+            .sort_values("Score perfil", ascending=False)
+            .head(limite)
+        )
+
     ranking = (
-        pd.DataFrame(filas)
+        df_filas
         .sort_values("Puntuación", ascending=False)
         .head(top_n)
         .reset_index(drop=True)
@@ -357,6 +482,7 @@ def calcular_ranking(
         "Coincidencias históricas",
         "Suma",
         "Paridad",
+        "Score perfil",
     ]
 
     for columna in columnas_score:
@@ -372,6 +498,9 @@ def ejecutar_backtesting(
     ventana,
     recencia,
     pesos,
+    usar_filtro_perfil,
+    ventana_perfil,
+    porcentaje_supervivencia,
 ):
     inicio = len(numeros) - cantidad_pruebas
     filas = []
@@ -392,6 +521,9 @@ def ejecutar_backtesting(
             peso_recencia=recencia,
             pesos=pesos,
             excluir_vistos=False,
+            usar_filtro_perfil=usar_filtro_perfil,
+            ventana_perfil=ventana_perfil,
+            porcentaje_supervivencia=porcentaje_supervivencia,
         )
 
         top100 = ranking["Número"].tolist()
@@ -420,8 +552,8 @@ def ejecutar_backtesting(
     return pd.DataFrame(filas)
 
 
-st.title("🎯 TRIS Predictor V6")
-st.caption("Motor modular con influencia aprendida del último resultado.")
+st.title("🎯 TRIS Predictor V7")
+st.caption("Filtro inteligente por perfil antes del ranking estadístico.")
 
 archivo_subido = st.sidebar.file_uploader(
     "Cargar tris_historico.csv",
@@ -450,8 +582,8 @@ m1.metric("Resultados", f"{len(datos):,}")
 m2.metric("Primera fecha", datos["fecha"].min().strftime("%d/%m/%Y"))
 m3.metric("Última fecha", datos["fecha"].max().strftime("%d/%m/%Y"))
 
-tab_ranking, tab_backtest, tab_base = st.tabs(
-    ["🎯 Ranking", "🧪 Backtesting", "🗂️ Base de datos"]
+tab_ranking, tab_backtest, tab_perfil, tab_base = st.tabs(
+    ["🎯 Ranking", "🧪 Backtesting", "🧬 Perfil", "🗂️ Base de datos"]
 )
 
 with st.sidebar.expander("⚙️ Pesos del modelo", expanded=True):
@@ -498,6 +630,18 @@ with tab_ranking:
     recencia = c5.slider("Peso de recencia", 0.0, 3.0, 1.5, 0.1)
     excluir = c6.checkbox("Excluir números ya vistos", value=False)
 
+    f1, f2, f3 = st.columns(3)
+    usar_filtro = f1.checkbox("Usar filtro inteligente", value=True)
+    ventana_perfil = f2.slider("Ventana del perfil", 50, 500, 200, 25)
+    supervivencia = f3.slider(
+        "Porcentaje que sobrevive",
+        1,
+        20,
+        5,
+        1,
+        help="5% equivale a aproximadamente 500 candidatos antes del ranking final.",
+    )
+
     filtrados = datos[datos["sorteo"] == sorteo].sort_values("fecha")
     numeros = preparar_directa4(filtrados, lado)
 
@@ -508,6 +652,9 @@ with tab_ranking:
         peso_recencia=recencia,
         pesos=pesos,
         excluir_vistos=excluir,
+        usar_filtro_perfil=usar_filtro,
+        ventana_perfil=ventana_perfil,
+        porcentaje_supervivencia=supervivencia,
     )
 
     if not ranking.empty:
@@ -527,7 +674,7 @@ with tab_ranking:
         st.download_button(
             "Descargar ranking CSV",
             ranking.to_csv(index=False).encode("utf-8-sig"),
-            file_name="ranking_v6.csv",
+            file_name="ranking_v7.csv",
             mime="text/csv",
         )
 
@@ -561,6 +708,29 @@ with tab_backtest:
         key="bt_recencia",
     )
 
+    bf1, bf2, bf3 = st.columns(3)
+    usar_filtro_bt = bf1.checkbox(
+        "Usar filtro inteligente",
+        value=True,
+        key="bt_usar_filtro",
+    )
+    ventana_perfil_bt = bf2.slider(
+        "Ventana del perfil",
+        50,
+        500,
+        200,
+        25,
+        key="bt_ventana_perfil",
+    )
+    supervivencia_bt = bf3.slider(
+        "Porcentaje que sobrevive",
+        1,
+        20,
+        5,
+        1,
+        key="bt_supervivencia",
+    )
+
     if st.button(
         "▶ Ejecutar backtesting",
         type="primary",
@@ -585,11 +755,14 @@ with tab_backtest:
                 ventana_bt,
                 recencia_bt,
                 pesos,
+                usar_filtro_bt,
+                ventana_perfil_bt,
+                supervivencia_bt,
             )
-            st.session_state["bt_v6"] = resultado
+            st.session_state["bt_v7"] = resultado
 
-    if "bt_v6" in st.session_state:
-        resultado = st.session_state["bt_v6"]
+    if "bt_v7" in st.session_state:
+        resultado = st.session_state["bt_v7"]
         total = len(resultado)
 
         a10 = int(resultado["Top 10"].sum())
@@ -617,9 +790,99 @@ with tab_backtest:
         st.download_button(
             "Descargar backtesting CSV",
             resultado.to_csv(index=False).encode("utf-8-sig"),
-            file_name="backtesting_v6.csv",
+            file_name="backtesting_v7.csv",
             mime="text/csv",
         )
+
+
+with tab_perfil:
+    st.subheader("Perfil histórico reciente")
+
+    p1, p2 = st.columns(2)
+    sorteo_perfil = p1.selectbox(
+        "Sorteo",
+        SORTEOS,
+        key="perfil_sorteo",
+    )
+    lado_perfil = p2.selectbox(
+        "Directa 4",
+        ["Últimos 4", "Primeros 4"],
+        key="perfil_lado",
+    )
+
+    p3, p4 = st.columns(2)
+    ventana_perfil_tab = p3.slider(
+        "Resultados usados para aprender el perfil",
+        50,
+        500,
+        200,
+        25,
+        key="perfil_ventana",
+    )
+    mostrar_perfiles = p4.slider(
+        "Cantidad de perfiles probables",
+        5,
+        30,
+        10,
+        5,
+    )
+
+    filtrados_perfil = (
+        datos[datos["sorteo"] == sorteo_perfil]
+        .sort_values("fecha")
+    )
+    numeros_perfil = preparar_directa4(
+        filtrados_perfil,
+        lado_perfil,
+    )
+
+    modelo_perfil = aprender_perfil(
+        numeros_perfil,
+        ventana_perfil=ventana_perfil_tab,
+    )
+
+    perfiles_posibles = []
+    for pares in range(5):
+        for repetidos in range(4):
+            for altos in range(5):
+                score = (
+                    0.4 * modelo_perfil["pares"].get(pares, 0)
+                    + 0.35 * modelo_perfil["repetidos"].get(repetidos, 0)
+                    + 0.25 * modelo_perfil["altos"].get(altos, 0)
+                )
+                perfiles_posibles.append(
+                    {
+                        "Pares": pares,
+                        "Impares": 4 - pares,
+                        "Repetidos": repetidos,
+                        "Dígitos altos": altos,
+                        "Dígitos bajos": 4 - altos,
+                        "Score": round(score * 100, 2),
+                    }
+                )
+
+    perfiles_df = (
+        pd.DataFrame(perfiles_posibles)
+        .sort_values("Score", ascending=False)
+        .head(mostrar_perfiles)
+        .reset_index(drop=True)
+    )
+    perfiles_df.insert(0, "Ranking", range(1, len(perfiles_df) + 1))
+
+    st.dataframe(
+        perfiles_df,
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    m1, m2, m3 = st.columns(3)
+    m1.metric("Suma promedio", f'{modelo_perfil["suma_media"]:.1f}')
+    m2.metric("Desviación de suma", f'{modelo_perfil["suma_std"]:.1f}')
+    m3.metric(
+        "Probabilidad histórica de iniciar con 0",
+        f'{modelo_perfil["prob_cero"] * 100:.1f}%',
+    )
+
 
 with tab_base:
     st.dataframe(
