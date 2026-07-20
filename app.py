@@ -1,149 +1,391 @@
-import re
-import sqlite3
-from datetime import datetime
+
 from pathlib import Path
 from collections import Counter, defaultdict
 
 import numpy as np
 import pandas as pd
-import requests
 import streamlit as st
-from bs4 import BeautifulSoup
 
-st.set_page_config(page_title='TRIS Predictor', page_icon='🎯', layout='wide')
-DB_PATH = Path('tris_resultados.db')
-BASE_URL = 'https://www.resultadostris.com/resultados.php'
-SORTEOS = ['Medio Día','De las Tres','Extra','De las Siete','Clásico']
+st.set_page_config(
+    page_title="TRIS Predictor V3",
+    page_icon="🎯",
+    layout="wide",
+)
 
-def init_db():
-    conn = sqlite3.connect(DB_PATH)
-    conn.execute('''CREATE TABLE IF NOT EXISTS resultados (
-        fecha TEXT NOT NULL,
-        sorteo TEXT NOT NULL,
-        numero TEXT NOT NULL,
-        fuente TEXT,
-        actualizado_en TEXT,
-        PRIMARY KEY (fecha, sorteo)
-    )''')
-    conn.commit()
-    return conn
+LOCAL_CSV = Path("tris_historico.csv")
+SORTEOS = ["Medio Día", "De las Tres", "Extra", "De las Siete", "Clásico"]
 
-def fetch_year(year):
-    url = BASE_URL if year == datetime.now().year else f'{BASE_URL}?anno={year}'
-    r = requests.get(url, headers={'User-Agent':'Mozilla/5.0'}, timeout=30)
-    r.raise_for_status()
-    text = BeautifulSoup(r.text, 'html.parser').get_text(' ', strip=True)
-    pat = re.compile(r'(\d{2}/\d{2}/\d{4})\s+(\d{5}|-----)\s+(\d{5}|-----)\s+(\d{5}|-----)\s+(\d{5}|-----)\s+(\d{5}|-----)')
-    rows=[]
-    for m in pat.finditer(text):
-        fecha, a,b,c,d,e = m.groups()
-        for sorteo, numero in zip(SORTEOS,[a,b,c,d,e]):
-            if numero != '-----':
-                rows.append({'fecha':pd.to_datetime(fecha,format='%d/%m/%Y').date().isoformat(),'sorteo':sorteo,'numero':numero,'fuente':url})
-    if not rows:
-        raise ValueError(f'No se encontraron resultados para {year}')
-    return pd.DataFrame(rows)
 
-def save_results(df):
-    conn=init_db(); before=conn.execute('SELECT COUNT(*) FROM resultados').fetchone()[0]
-    now=datetime.now().isoformat(timespec='seconds')
-    rec=[(r.fecha,r.sorteo,str(r.numero).zfill(5),r.fuente,now) for r in df.itertuples(index=False)]
-    conn.executemany('''INSERT INTO resultados(fecha,sorteo,numero,fuente,actualizado_en)
-    VALUES(?,?,?,?,?) ON CONFLICT(fecha,sorteo) DO UPDATE SET numero=excluded.numero,fuente=excluded.fuente,actualizado_en=excluded.actualizado_en''',rec)
-    conn.commit(); after=conn.execute('SELECT COUNT(*) FROM resultados').fetchone()[0]; conn.close(); return after-before
+@st.cache_data
+def leer_csv(origen):
+    df = pd.read_csv(origen, dtype={"numero": str})
 
-def load_results():
-    conn=init_db(); df=pd.read_sql_query('SELECT * FROM resultados',conn,dtype={'numero':str}); conn.close()
-    if not df.empty:
-        df['fecha']=pd.to_datetime(df['fecha']); df['numero']=df['numero'].astype(str).str.zfill(5)
-    return df
+    requeridas = {"fecha", "sorteo", "numero"}
+    faltantes = requeridas - set(df.columns)
+    if faltantes:
+        raise ValueError(
+            "El archivo no contiene las columnas requeridas: "
+            + ", ".join(sorted(faltantes))
+        )
 
-def normalize(counter, keys):
-    vals=np.array([counter.get(k,0.0) for k in keys],float)
-    if vals.max()==vals.min(): return {k:0.5 for k in keys}
-    vals=(vals-vals.min())/(vals.max()-vals.min())
-    return dict(zip(keys,vals))
+    df = df[["fecha", "sorteo", "numero"]].copy()
+    df["fecha"] = pd.to_datetime(df["fecha"], errors="coerce")
+    df["numero"] = (
+        df["numero"]
+        .astype(str)
+        .str.replace(r"\.0$", "", regex=True)
+        .str.zfill(5)
+    )
+    df = df.dropna(subset=["fecha"])
+    df = df[df["numero"].str.fullmatch(r"\d{5}", na=False)]
+    df = df.drop_duplicates(subset=["fecha", "sorteo"], keep="last")
+    return df.sort_values(["fecha", "sorteo"]).reset_index(drop=True)
 
-def rank_direct4(numbers, top_n, recent_window, recency_strength, exclude_seen):
-    n=len(numbers)
-    if n<10: return pd.DataFrame()
-    weights=np.ones(n); w=min(recent_window,n)
-    weights[-w:]=np.linspace(1.0,1.0+recency_strength,w)
-    digits=[str(i) for i in range(10)]
-    pos=[Counter() for _ in range(4)]; glob=Counter(); pair=[Counter() for _ in range(3)]; trans=[defaultdict(Counter) for _ in range(3)]
-    for num,wt in zip(numbers,weights):
-        for i,d in enumerate(num): pos[i][d]+=wt; glob[d]+=wt
-        for i in range(3): pair[i][num[i:i+2]]+=wt; trans[i][num[i]][num[i+1]]+=wt
-    posn=[normalize(c,digits) for c in pos]; globn=normalize(glob,digits); pkeys=[f'{i:02d}' for i in range(100)]; pairn=[normalize(c,pkeys) for c in pair]
-    transn=[{d:normalize(trans[i][d],digits) for d in digits} for i in range(3)]
-    seen=set(numbers); rows=[]
-    for v in range(10000):
-        num=f'{v:04d}'
-        if exclude_seen and num in seen: continue
-        d=list(num)
-        ps=sum(posn[i][d[i]] for i in range(4))/4
-        gs=sum(globn[x] for x in d)/4
-        prs=sum(pairn[i][num[i:i+2]] for i in range(3))/3
-        ts=sum(transn[i][d[i]][d[i+1]] for i in range(3))/3
-        rep=(4-len(set(d)))/3; mir=(int(d[0]==d[3])+int(d[1]==d[2]))/2
-        score=.38*ps+.18*gs+.22*prs+.17*ts+.03*rep+.02*mir
-        rows.append({'Número':num,'Puntuación':score,'Posición':ps,'Pares':prs,'Transiciones':ts,'Frecuencia':gs})
-    out=pd.DataFrame(rows).sort_values('Puntuación',ascending=False).head(top_n).reset_index(drop=True)
-    out.insert(0,'Ranking',range(1,len(out)+1))
-    for c in ['Puntuación','Posición','Pares','Transiciones','Frecuencia']: out[c]=(out[c]*100).round(2)
-    return out
 
-st.title('🎯 TRIS Predictor V2')
-st.caption('Histórico automático y ranking estadístico para Directa 4.')
+def normalizar(contador, claves):
+    valores = np.array([contador.get(k, 0.0) for k in claves], dtype=float)
+    if valores.max() == valores.min():
+        return {k: 0.5 for k in claves}
+    valores = (valores - valores.min()) / (valores.max() - valores.min())
+    return dict(zip(claves, valores))
 
-t1,t2,t3=st.tabs(['Actualizar resultados','Analizar Directa 4','Base de datos'])
-with t1:
-    st.subheader('Descargar histórico automáticamente')
-    y=datetime.now().year
-    c1,c2=st.columns(2)
-    start=int(c1.number_input('Desde el año',2015,y,2015)); end=int(c2.number_input('Hasta el año',2015,y,y))
-    if st.button('🔄 Actualizar resultados',type='primary',use_container_width=True):
-        if start>end: st.error('El año inicial no puede ser mayor.')
-        else:
-            frames=[]; errors=[]; years=list(range(start,end+1)); prog=st.progress(0); status=st.empty()
-            for i,yr in enumerate(years,1):
-                status.write(f'Descargando {yr}...')
-                try: frames.append(fetch_year(yr))
-                except Exception as e: errors.append(f'{yr}: {e}')
-                prog.progress(i/len(years))
-            status.empty(); prog.empty()
-            if frames:
-                all_df=pd.concat(frames,ignore_index=True); added=save_results(all_df)
-                st.success(f'Listo: {len(all_df):,} registros leídos y {added:,} nuevos guardados.')
-            if errors: st.warning(' | '.join(errors))
-    df=load_results()
-    if not df.empty:
-        a,b,c=st.columns(3); a.metric('Registros',f'{len(df):,}'); b.metric('Primera fecha',df.fecha.min().strftime('%d/%m/%Y')); c.metric('Última fecha',df.fecha.max().strftime('%d/%m/%Y'))
-with t2:
-    df=load_results()
-    if df.empty: st.info('Primero actualiza los resultados.')
+
+def preparar_directa4(df, lado):
+    numeros = df["numero"].astype(str).str.zfill(5)
+    if lado == "Primeros 4":
+        return numeros.str[:4].tolist()
+    return numeros.str[-4:].tolist()
+
+
+def calcular_ranking(
+    numeros,
+    top_n=30,
+    ventana_reciente=150,
+    peso_recencia=1.5,
+    excluir_vistos=False,
+):
+    if len(numeros) < 10:
+        return pd.DataFrame()
+
+    cantidad = len(numeros)
+    pesos = np.ones(cantidad)
+    ventana = min(ventana_reciente, cantidad)
+
+    if ventana:
+        pesos[-ventana:] = np.linspace(1.0, 1.0 + peso_recencia, ventana)
+
+    digitos = [str(i) for i in range(10)]
+    pares = [f"{i:02d}" for i in range(100)]
+
+    frecuencia_global = Counter()
+    frecuencia_posicion = [Counter() for _ in range(4)]
+    frecuencia_pares = [Counter() for _ in range(3)]
+    transiciones = [defaultdict(Counter) for _ in range(3)]
+
+    for numero, peso in zip(numeros, pesos):
+        for pos, digito in enumerate(numero):
+            frecuencia_global[digito] += peso
+            frecuencia_posicion[pos][digito] += peso
+
+        for pos in range(3):
+            frecuencia_pares[pos][numero[pos:pos + 2]] += peso
+            transiciones[pos][numero[pos]][numero[pos + 1]] += peso
+
+    global_norm = normalizar(frecuencia_global, digitos)
+    posicion_norm = [
+        normalizar(contador, digitos)
+        for contador in frecuencia_posicion
+    ]
+    pares_norm = [
+        normalizar(contador, pares)
+        for contador in frecuencia_pares
+    ]
+
+    transiciones_norm = []
+    for pos in range(3):
+        por_digito = {}
+        for digito in digitos:
+            por_digito[digito] = normalizar(
+                transiciones[pos][digito],
+                digitos,
+            )
+        transiciones_norm.append(por_digito)
+
+    vistos = set(numeros)
+    filas = []
+
+    for valor in range(10000):
+        numero = f"{valor:04d}"
+
+        if excluir_vistos and numero in vistos:
+            continue
+
+        d = list(numero)
+
+        puntuacion_posicion = sum(
+            posicion_norm[pos][d[pos]]
+            for pos in range(4)
+        ) / 4
+
+        puntuacion_global = sum(
+            global_norm[digito]
+            for digito in d
+        ) / 4
+
+        puntuacion_pares = sum(
+            pares_norm[pos][numero[pos:pos + 2]]
+            for pos in range(3)
+        ) / 3
+
+        puntuacion_transiciones = sum(
+            transiciones_norm[pos][d[pos]][d[pos + 1]]
+            for pos in range(3)
+        ) / 3
+
+        repeticion = (4 - len(set(d))) / 3
+        espejo = (
+            int(d[0] == d[3]) +
+            int(d[1] == d[2])
+        ) / 2
+
+        puntuacion = (
+            0.38 * puntuacion_posicion
+            + 0.18 * puntuacion_global
+            + 0.22 * puntuacion_pares
+            + 0.17 * puntuacion_transiciones
+            + 0.03 * repeticion
+            + 0.02 * espejo
+        )
+
+        filas.append(
+            {
+                "Número": numero,
+                "Puntuación": puntuacion,
+                "Posición": puntuacion_posicion,
+                "Pares": puntuacion_pares,
+                "Transiciones": puntuacion_transiciones,
+                "Frecuencia": puntuacion_global,
+            }
+        )
+
+    ranking = (
+        pd.DataFrame(filas)
+        .sort_values("Puntuación", ascending=False)
+        .head(top_n)
+        .reset_index(drop=True)
+    )
+
+    ranking.insert(0, "Ranking", np.arange(1, len(ranking) + 1))
+
+    for columna in [
+        "Puntuación",
+        "Posición",
+        "Pares",
+        "Transiciones",
+        "Frecuencia",
+    ]:
+        ranking[columna] = (ranking[columna] * 100).round(2)
+
+    return ranking
+
+
+def tabla_frecuencias(numeros):
+    filas = []
+    for posicion in range(4):
+        contador = Counter(numero[posicion] for numero in numeros)
+        total = sum(contador.values())
+
+        for digito in range(10):
+            valor = contador.get(str(digito), 0)
+            filas.append(
+                {
+                    "Posición": posicion + 1,
+                    "Dígito": str(digito),
+                    "Apariciones": valor,
+                    "Porcentaje": round(valor / total * 100, 2) if total else 0,
+                }
+            )
+
+    return pd.DataFrame(filas)
+
+
+st.title("🎯 TRIS Predictor V3")
+st.caption("Analizador estadístico de Directa 4 usando tu histórico descargado.")
+
+archivo_subido = st.sidebar.file_uploader(
+    "Cargar tris_historico.csv",
+    type=["csv"],
+    help="Sube el archivo generado por actualizar_tris.py.",
+)
+
+try:
+    if archivo_subido is not None:
+        datos = leer_csv(archivo_subido)
+        origen = "Archivo cargado manualmente"
+    elif LOCAL_CSV.exists():
+        datos = leer_csv(LOCAL_CSV)
+        origen = "Archivo incluido en la aplicación"
     else:
-        a,b,c=st.columns(3)
-        sorteo=a.selectbox('Sorteo',SORTEOS); lado=b.selectbox('Directa 4',['Últimos 4','Primeros 4']); topn=c.slider('Cantidad',10,100,30,10)
-        d,e,f=st.columns(3); win=d.slider('Ventana reciente',20,500,120,10); strength=e.slider('Peso de recencia',0.0,3.0,1.5,.1); exclude=f.checkbox('Excluir ya vistos')
-        nums=df[df.sorteo==sorteo].sort_values('fecha').numero.astype(str).str.zfill(5)
-        nums=(nums.str[-4:] if lado=='Últimos 4' else nums.str[:4]).tolist()
-        out=rank_direct4(nums,topn,win,strength,exclude)
-        st.write(f'Analizando **{len(nums):,} sorteos** de **{sorteo}**.')
-        if not out.empty:
-            x,y,z=st.columns(3); x.metric('Mejor clasificado',out.iloc[0]['Número']); y.metric('Puntuación',f"{out.iloc[0]['Puntuación']:.2f}"); z.metric('Top',len(out))
-            st.dataframe(out,use_container_width=True,hide_index=True)
-            st.download_button('Descargar ranking CSV',out.to_csv(index=False).encode('utf-8-sig'),'ranking_directa4.csv','text/csv')
-            st.caption('La puntuación ordena patrones históricos; no es una probabilidad real ni garantiza un resultado.')
-with t3:
-    df=load_results()
-    if df.empty: st.info('No hay datos todavía.')
+        datos = pd.DataFrame()
+        origen = None
+except Exception as error:
+    st.error(f"No se pudo leer el archivo: {error}")
+    st.stop()
+
+if datos.empty:
+    st.warning(
+        "Falta el archivo de resultados. Usa el panel lateral para subir "
+        "`tris_historico.csv`."
+    )
+    st.stop()
+
+st.sidebar.success(f"{len(datos):,} resultados cargados")
+st.sidebar.caption(origen)
+
+ultima_fecha = datos["fecha"].max()
+primera_fecha = datos["fecha"].min()
+
+m1, m2, m3 = st.columns(3)
+m1.metric("Resultados cargados", f"{len(datos):,}")
+m2.metric("Primera fecha", primera_fecha.strftime("%d/%m/%Y"))
+m3.metric("Última fecha", ultima_fecha.strftime("%d/%m/%Y"))
+
+tab_prediccion, tab_analisis, tab_base = st.tabs(
+    ["🎯 Ranking Directa 4", "📊 Análisis", "🗂️ Base de datos"]
+)
+
+with tab_prediccion:
+    c1, c2, c3 = st.columns(3)
+
+    sorteo = c1.selectbox("Sorteo", SORTEOS)
+    lado = c2.selectbox("Directa 4", ["Últimos 4", "Primeros 4"])
+    top_n = c3.slider("Cantidad de candidatos", 10, 100, 30, 10)
+
+    c4, c5, c6 = st.columns(3)
+
+    ventana = c4.slider(
+        "Resultados recientes con mayor peso",
+        20,
+        500,
+        150,
+        10,
+    )
+    recencia = c5.slider(
+        "Peso de resultados recientes",
+        0.0,
+        3.0,
+        1.5,
+        0.1,
+    )
+    excluir = c6.checkbox(
+        "Excluir combinaciones ya vistas",
+        value=False,
+    )
+
+    filtrados = datos[datos["sorteo"] == sorteo].sort_values("fecha")
+    numeros = preparar_directa4(filtrados, lado)
+
+    ranking = calcular_ranking(
+        numeros,
+        top_n=top_n,
+        ventana_reciente=ventana,
+        peso_recencia=recencia,
+        excluir_vistos=excluir,
+    )
+
+    st.write(
+        f"Analizando **{len(numeros):,} resultados** del sorteo "
+        f"**{sorteo}**."
+    )
+
+    if ranking.empty:
+        st.warning("No hay suficientes resultados para calcular el ranking.")
     else:
-        st.dataframe(df.sort_values('fecha',ascending=False)[['fecha','sorteo','numero']],use_container_width=True,hide_index=True)
-        st.download_button('Descargar toda la base CSV',df[['fecha','sorteo','numero']].to_csv(index=False).encode('utf-8-sig'),'tris_historico.csv','text/csv')
-        up=st.file_uploader('Restaurar/importar CSV',type=['csv'])
-        if up is not None:
-            imp=pd.read_csv(up,dtype={'numero':str})
-            if {'fecha','sorteo','numero'}.issubset(imp.columns):
-                imp['numero']=imp.numero.astype(str).str.zfill(5); imp['fuente']='CSV importado'; added=save_results(imp[['fecha','sorteo','numero','fuente']]); st.success(f'Importado. Nuevos: {added}')
-            else: st.error('El CSV debe contener fecha, sorteo y numero.')
+        mejor = ranking.iloc[0]
+
+        r1, r2, r3 = st.columns(3)
+        r1.metric("Mejor clasificado", mejor["Número"])
+        r2.metric("Puntuación interna", f'{mejor["Puntuación"]:.2f}')
+        r3.metric("Candidatos mostrados", len(ranking))
+
+        st.dataframe(
+            ranking,
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        st.download_button(
+            "Descargar ranking CSV",
+            ranking.to_csv(index=False).encode("utf-8-sig"),
+            file_name=f"ranking_{sorteo}_{lado}.csv",
+            mime="text/csv",
+        )
+
+        st.info(
+            "La puntuación sirve para ordenar patrones históricos. "
+            "No es una probabilidad real ni garantiza un resultado."
+        )
+
+with tab_analisis:
+    c1, c2 = st.columns(2)
+    sorteo_analisis = c1.selectbox(
+        "Sorteo para analizar",
+        SORTEOS,
+        key="sorteo_analisis",
+    )
+    lado_analisis = c2.selectbox(
+        "Sección de Directa 4",
+        ["Últimos 4", "Primeros 4"],
+        key="lado_analisis",
+    )
+
+    filtrados = datos[datos["sorteo"] == sorteo_analisis].sort_values("fecha")
+    numeros = preparar_directa4(filtrados, lado_analisis)
+    frecuencias = tabla_frecuencias(numeros)
+
+    pivot = frecuencias.pivot(
+        index="Dígito",
+        columns="Posición",
+        values="Porcentaje",
+    )
+
+    st.subheader("Frecuencia porcentual por posición")
+    st.dataframe(pivot, use_container_width=True)
+
+    globales = Counter("".join(numeros))
+    global_df = pd.DataFrame(
+        {
+            "Dígito": [str(i) for i in range(10)],
+            "Apariciones": [globales.get(str(i), 0) for i in range(10)],
+        }
+    ).sort_values("Apariciones", ascending=False)
+
+    st.subheader("Dígitos más frecuentes")
+    st.bar_chart(global_df.set_index("Dígito"))
+
+    st.subheader("Últimos 30 resultados analizados")
+    recientes = filtrados.sort_values("fecha", ascending=False).head(30).copy()
+    recientes["Directa 4"] = preparar_directa4(
+        recientes.sort_values("fecha"),
+        lado_analisis,
+    )[::-1]
+
+    st.dataframe(
+        recientes[["fecha", "sorteo", "numero", "Directa 4"]],
+        use_container_width=True,
+        hide_index=True,
+    )
+
+with tab_base:
+    st.dataframe(
+        datos.sort_values("fecha", ascending=False),
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    st.download_button(
+        "Descargar base completa",
+        datos.to_csv(index=False).encode("utf-8-sig"),
+        file_name="tris_historico_limpio.csv",
+        mime="text/csv",
+    )
