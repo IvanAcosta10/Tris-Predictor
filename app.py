@@ -6,11 +6,11 @@ import time
 import numpy as np
 import pandas as pd
 import streamlit as st
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.metrics import log_loss
+from sklearn.ensemble import RandomForestClassifier, ExtraTreesClassifier
+from sklearn.multioutput import MultiOutputClassifier
 
 st.set_page_config(
-    page_title="TRIS AI V1",
+    page_title="TRIS Predictor AI V2",
     page_icon="🧠",
     layout="wide",
 )
@@ -26,9 +26,7 @@ def leer_csv(origen):
     faltantes = requeridas - set(df.columns)
 
     if faltantes:
-        raise ValueError(
-            "Faltan columnas: " + ", ".join(sorted(faltantes))
-        )
+        raise ValueError("Faltan columnas: " + ", ".join(sorted(faltantes)))
 
     df = df[["fecha", "sorteo", "numero"]].copy()
     df["fecha"] = pd.to_datetime(df["fecha"], errors="coerce")
@@ -51,40 +49,53 @@ def preparar_directa4(df, lado):
     return serie.str[-4:].tolist()
 
 
-def caracteristicas_numero(numero):
+def perfil(numero):
+    d = [int(x) for x in numero]
+    return {
+        "pares": sum(x % 2 == 0 for x in d),
+        "altos": sum(x >= 5 for x in d),
+        "repetidos": 4 - len(set(numero)),
+        "rango_suma": min(sum(d) // 5, 7),
+        "consecutivos": min(
+            sum(abs(d[i] - d[i + 1]) == 1 for i in range(3)),
+            2,
+        ),
+    }
+
+
+def features_numero(numero):
     d = np.array([int(x) for x in numero], dtype=float)
+    p = perfil(numero)
     return [
+        *d.tolist(),
         d.sum(),
         d.mean(),
         d.std(),
+        d.max(),
+        d.min(),
         len(set(numero)),
-        sum(x % 2 == 0 for x in d),
-        sum(x >= 5 for x in d),
-        abs(d[0] - d[1]),
-        abs(d[1] - d[2]),
-        abs(d[2] - d[3]),
+        p["pares"],
+        p["altos"],
+        p["repetidos"],
+        p["rango_suma"],
+        p["consecutivos"],
         int(d[0] == d[3]),
         int(d[1] == d[2]),
     ]
 
 
-def crear_dataset(numeros, lags=10):
+def crear_dataset(numeros, lags):
     X = []
-    y = [[], [], [], []]
+    y_digitos = [[], [], [], []]
+    y_perfiles = []
 
-    for indice in range(lags, len(numeros)):
-        historial = numeros[indice - lags:indice]
+    for i in range(lags, len(numeros)):
+        historial = numeros[i - lags:i]
         fila = []
 
-        # Dígitos de los últimos sorteos.
         for numero in historial:
-            fila.extend(int(x) for x in numero)
+            fila.extend(features_numero(numero))
 
-        # Características de cada sorteo anterior.
-        for numero in historial:
-            fila.extend(caracteristicas_numero(numero))
-
-        # Cambios entre sorteos consecutivos.
         for j in range(1, len(historial)):
             anterior = historial[j - 1]
             actual = historial[j]
@@ -92,28 +103,47 @@ def crear_dataset(numeros, lags=10):
                 (int(actual[pos]) - int(anterior[pos])) % 10
                 for pos in range(4)
             )
+            fila.extend(
+                int(actual[pos] == anterior[pos])
+                for pos in range(4)
+            )
+
+        # Frecuencias recientes por posición.
+        for pos in range(4):
+            conteo = np.bincount(
+                [int(n[pos]) for n in historial],
+                minlength=10,
+            ) / len(historial)
+            fila.extend(conteo.tolist())
 
         X.append(fila)
 
-        objetivo = numeros[indice]
-        for posicion in range(4):
-            y[posicion].append(int(objetivo[posicion]))
+        objetivo = numeros[i]
+        for pos in range(4):
+            y_digitos[pos].append(int(objetivo[pos]))
 
-    return np.asarray(X, dtype=np.float32), [
-        np.asarray(valores, dtype=np.int64)
-        for valores in y
-    ]
+        p = perfil(objetivo)
+        y_perfiles.append([
+            p["pares"],
+            p["altos"],
+            p["repetidos"],
+            p["rango_suma"],
+            p["consecutivos"],
+        ])
+
+    return (
+        np.asarray(X, dtype=np.float32),
+        [np.asarray(y, dtype=np.int64) for y in y_digitos],
+        np.asarray(y_perfiles, dtype=np.int64),
+    )
 
 
-def crear_fila_prediccion(numeros, lags=10):
+def fila_prediccion(numeros, lags):
     historial = numeros[-lags:]
     fila = []
 
     for numero in historial:
-        fila.extend(int(x) for x in numero)
-
-    for numero in historial:
-        fila.extend(caracteristicas_numero(numero))
+        fila.extend(features_numero(numero))
 
     for j in range(1, len(historial)):
         anterior = historial[j - 1]
@@ -122,93 +152,183 @@ def crear_fila_prediccion(numeros, lags=10):
             (int(actual[pos]) - int(anterior[pos])) % 10
             for pos in range(4)
         )
+        fila.extend(
+            int(actual[pos] == anterior[pos])
+            for pos in range(4)
+        )
+
+    for pos in range(4):
+        conteo = np.bincount(
+            [int(n[pos]) for n in historial],
+            minlength=10,
+        ) / len(historial)
+        fila.extend(conteo.tolist())
 
     return np.asarray([fila], dtype=np.float32)
 
 
-def crear_modelos(
+def entrenar_modelos(
     numeros,
-    lags=10,
-    max_entrenamiento=3000,
-    arboles=150,
-    profundidad=12,
-    semilla=42,
+    lags,
+    max_muestras,
+    arboles,
+    profundidad,
+    semilla,
 ):
-    X, ys = crear_dataset(numeros, lags=lags)
+    X, ys_digitos, y_perfiles = crear_dataset(numeros, lags)
 
-    if len(X) < 200:
-        raise ValueError("No hay suficientes sorteos para entrenar.")
+    if len(X) < 250:
+        raise ValueError("No hay suficientes datos para entrenar.")
 
-    if len(X) > max_entrenamiento:
-        X = X[-max_entrenamiento:]
-        ys = [y[-max_entrenamiento:] for y in ys]
+    if len(X) > max_muestras:
+        X = X[-max_muestras:]
+        ys_digitos = [y[-max_muestras:] for y in ys_digitos]
+        y_perfiles = y_perfiles[-max_muestras:]
 
-    modelos = []
+    modelos_rf = []
+    modelos_et = []
 
-    for posicion in range(4):
-        modelo = RandomForestClassifier(
+    for pos in range(4):
+        rf = RandomForestClassifier(
             n_estimators=arboles,
             max_depth=profundidad,
-            min_samples_leaf=3,
+            min_samples_leaf=4,
             max_features="sqrt",
             class_weight="balanced_subsample",
-            random_state=semilla + posicion,
+            random_state=semilla + pos,
             n_jobs=-1,
         )
-        modelo.fit(X, ys[posicion])
-        modelos.append(modelo)
+        et = ExtraTreesClassifier(
+            n_estimators=arboles,
+            max_depth=profundidad,
+            min_samples_leaf=4,
+            max_features="sqrt",
+            class_weight="balanced",
+            random_state=semilla + 100 + pos,
+            n_jobs=-1,
+        )
+        rf.fit(X, ys_digitos[pos])
+        et.fit(X, ys_digitos[pos])
+        modelos_rf.append(rf)
+        modelos_et.append(et)
 
-    return modelos
+    perfil_base = RandomForestClassifier(
+        n_estimators=arboles,
+        max_depth=profundidad,
+        min_samples_leaf=4,
+        max_features="sqrt",
+        class_weight="balanced_subsample",
+        random_state=semilla + 500,
+        n_jobs=-1,
+    )
+    modelo_perfil = MultiOutputClassifier(perfil_base, n_jobs=-1)
+    modelo_perfil.fit(X, y_perfiles)
+
+    return modelos_rf, modelos_et, modelo_perfil
 
 
-def probabilidades_posicion(modelos, numeros, lags):
-    fila = crear_fila_prediccion(numeros, lags=lags)
-    probabilidades = []
+def probs_clases(modelo, fila, total_clases):
+    salida = np.full(total_clases, 1e-9, dtype=float)
+    probs = modelo.predict_proba(fila)[0]
 
-    for modelo in modelos:
-        probs_modelo = modelo.predict_proba(fila)[0]
-        probs = np.full(10, 1e-9, dtype=float)
+    for clase, prob in zip(modelo.classes_, probs):
+        salida[int(clase)] = float(prob)
 
-        for clase, prob in zip(modelo.classes_, probs_modelo):
-            probs[int(clase)] = float(prob)
-
-        probs = probs / probs.sum()
-        probabilidades.append(probs)
-
-    return probabilidades
+    salida /= salida.sum()
+    return salida
 
 
-def ranking_combinaciones(probabilidades, top_n=100):
+def obtener_predicciones(
+    modelos_rf,
+    modelos_et,
+    modelo_perfil,
+    numeros,
+    lags,
+):
+    fila = fila_prediccion(numeros, lags)
+
+    probs_posiciones = []
+    for pos in range(4):
+        rf = probs_clases(modelos_rf[pos], fila, 10)
+        et = probs_clases(modelos_et[pos], fila, 10)
+        probs_posiciones.append(0.5 * rf + 0.5 * et)
+
+    probs_perfil = []
+    tamanos = [5, 5, 4, 8, 3]
+
+    for estimador, tamano in zip(modelo_perfil.estimators_, tamanos):
+        probs_perfil.append(probs_clases(estimador, fila, tamano))
+
+    return probs_posiciones, probs_perfil
+
+
+def score_perfil(numero, probs_perfil):
+    p = perfil(numero)
+    valores = [
+        p["pares"],
+        p["altos"],
+        p["repetidos"],
+        p["rango_suma"],
+        p["consecutivos"],
+    ]
+    return float(np.mean([
+        probs_perfil[i][valores[i]]
+        for i in range(len(valores))
+    ]))
+
+
+def ranking_hibrido(
+    probs_posiciones,
+    probs_perfil,
+    top_n,
+    supervivencia,
+):
     filas = []
 
     for digitos in itertools.product(range(10), repeat=4):
         numero = "".join(str(x) for x in digitos)
-        probs = [
-            probabilidades[pos][digitos[pos]]
-            for pos in range(4)
-        ]
 
-        # Producto geométrico para evitar que una posición domine demasiado.
-        score = float(np.prod(probs) ** 0.25)
+        score_digitos = float(np.prod([
+            probs_posiciones[pos][digitos[pos]]
+            for pos in range(4)
+        ]) ** 0.25)
+
+        score_p = score_perfil(numero, probs_perfil)
 
         filas.append({
             "Número": numero,
-            "Score IA": score,
-            "P1": probs[0],
-            "P2": probs[1],
-            "P3": probs[2],
-            "P4": probs[3],
+            "Score dígitos": score_digitos,
+            "Score perfil": score_p,
         })
 
+    df = pd.DataFrame(filas)
+
+    sobrevivientes = max(
+        top_n,
+        int(10000 * supervivencia / 100),
+    )
+
+    # Primero descarta por perfil.
+    df = (
+        df.sort_values("Score perfil", ascending=False)
+        .head(sobrevivientes)
+        .copy()
+    )
+
+    # Después combina ambos modelos.
+    df["Score final"] = (
+        0.68 * df["Score dígitos"]
+        + 0.32 * df["Score perfil"]
+    )
+
     ranking = (
-        pd.DataFrame(filas)
-        .sort_values("Score IA", ascending=False)
+        df.sort_values("Score final", ascending=False)
         .head(top_n)
         .reset_index(drop=True)
     )
     ranking.insert(0, "Ranking", range(1, len(ranking) + 1))
 
-    for columna in ["Score IA", "P1", "P2", "P3", "P4"]:
+    for columna in ["Score dígitos", "Score perfil", "Score final"]:
         ranking[columna] = (ranking[columna] * 100).round(4)
 
     return ranking
@@ -219,9 +339,10 @@ def ejecutar_backtesting(
     fechas,
     pruebas,
     lags,
-    max_entrenamiento,
+    max_muestras,
     arboles,
     profundidad,
+    supervivencia,
 ):
     inicio = len(numeros) - pruebas
     filas = []
@@ -232,34 +353,37 @@ def ejecutar_backtesting(
         entrenamiento = numeros[:indice]
         real = numeros[indice]
 
-        modelos = crear_modelos(
+        modelos_rf, modelos_et, modelo_perfil = entrenar_modelos(
             entrenamiento,
-            lags=lags,
-            max_entrenamiento=max_entrenamiento,
-            arboles=arboles,
-            profundidad=profundidad,
-            semilla=1000 + indice,
+            lags,
+            max_muestras,
+            arboles,
+            profundidad,
+            semilla=2000 + indice,
         )
-        probabilidades = probabilidades_posicion(
-            modelos,
+
+        probs_posiciones, probs_perfil = obtener_predicciones(
+            modelos_rf,
+            modelos_et,
+            modelo_perfil,
             entrenamiento,
             lags,
         )
-        ranking = ranking_combinaciones(probabilidades, top_n=100)
+
+        ranking = ranking_hibrido(
+            probs_posiciones,
+            probs_perfil,
+            top_n=100,
+            supervivencia=supervivencia,
+        )
+
         top100 = ranking["Número"].tolist()
-
         posicion = top100.index(real) + 1 if real in top100 else None
-
-        prob_real = np.prod([
-            probabilidades[pos][int(real[pos])]
-            for pos in range(4)
-        ]) ** 0.25
 
         filas.append({
             "Fecha": fechas[indice],
             "Resultado real": real,
             "Ranking": posicion if posicion else "Fuera del Top 100",
-            "Score real": round(float(prob_real) * 100, 4),
             "Top 10": posicion is not None and posicion <= 10,
             "Top 20": posicion is not None and posicion <= 20,
             "Top 50": posicion is not None and posicion <= 50,
@@ -277,10 +401,9 @@ def ejecutar_backtesting(
     return pd.DataFrame(filas)
 
 
-st.title("🧠 TRIS AI V1")
+st.title("🧠 TRIS Predictor AI V2")
 st.caption(
-    "Random Forest temporal: aprende de secuencias anteriores y estima "
-    "cada dígito de la siguiente Directa 4."
+    "Ensamble de Random Forest + Extra Trees + predictor de perfiles."
 )
 
 archivo_subido = st.sidebar.file_uploader(
@@ -305,33 +428,22 @@ if datos.empty:
 
 st.sidebar.success(f"{len(datos):,} resultados cargados")
 
-with st.sidebar.expander("⚙️ Configuración IA", expanded=True):
-    lags = st.slider(
-        "Sorteos anteriores usados",
-        5,
-        30,
-        10,
-        1,
-    )
-    max_entrenamiento = st.slider(
-        "Máximo de muestras de entrenamiento",
+with st.sidebar.expander("⚙️ Configuración", expanded=True):
+    lags = st.slider("Sorteos anteriores usados", 5, 25, 12, 1)
+    max_muestras = st.slider(
+        "Muestras máximas",
         500,
         4000,
         2500,
         250,
     )
-    arboles = st.slider(
-        "Árboles por modelo",
-        50,
-        300,
-        120,
-        10,
-    )
-    profundidad = st.slider(
-        "Profundidad máxima",
-        4,
+    arboles = st.slider("Árboles por modelo", 50, 250, 100, 10)
+    profundidad = st.slider("Profundidad máxima", 4, 18, 10, 1)
+    supervivencia = st.slider(
+        "Porcentaje que sobrevive al filtro",
+        1,
         20,
-        10,
+        5,
         1,
     )
 
@@ -340,15 +452,15 @@ m1.metric("Resultados", f"{len(datos):,}")
 m2.metric("Primera fecha", datos["fecha"].min().strftime("%d/%m/%Y"))
 m3.metric("Última fecha", datos["fecha"].max().strftime("%d/%m/%Y"))
 
-tab_prediccion, tab_backtest, tab_modelo, tab_base = st.tabs(
-    ["🎯 Predicción IA", "🧪 Backtesting IA", "🔍 Modelo", "🗂️ Base"]
+tab_pred, tab_bt, tab_explicacion, tab_base = st.tabs(
+    ["🎯 Predicción", "🧪 Backtesting", "🔍 Cómo funciona", "🗂️ Base"]
 )
 
-with tab_prediccion:
+with tab_pred:
     c1, c2, c3 = st.columns(3)
     sorteo = c1.selectbox("Sorteo", SORTEOS)
     lado = c2.selectbox("Directa 4", ["Últimos 4", "Primeros 4"])
-    top_n = c3.slider("Candidatos mostrados", 10, 100, 30, 10)
+    top_n = c3.slider("Candidatos", 10, 100, 30, 10)
 
     filtrados = (
         datos[datos["sorteo"] == sorteo]
@@ -358,70 +470,61 @@ with tab_prediccion:
     numeros = preparar_directa4(filtrados, lado)
 
     if st.button(
-        "🧠 Entrenar IA y generar ranking",
+        "🧠 Entrenar y generar ranking",
         type="primary",
         use_container_width=True,
     ):
-        with st.spinner("Entrenando cuatro modelos Random Forest..."):
-            inicio = time.time()
-            modelos = crear_modelos(
+        inicio = time.time()
+
+        with st.spinner("Entrenando ensamble y predictor de perfiles..."):
+            modelos_rf, modelos_et, modelo_perfil = entrenar_modelos(
                 numeros,
-                lags=lags,
-                max_entrenamiento=max_entrenamiento,
-                arboles=arboles,
-                profundidad=profundidad,
+                lags,
+                max_muestras,
+                arboles,
+                profundidad,
+                semilla=42,
             )
-            probabilidades = probabilidades_posicion(
-                modelos,
+            probs_posiciones, probs_perfil = obtener_predicciones(
+                modelos_rf,
+                modelos_et,
+                modelo_perfil,
                 numeros,
                 lags,
             )
-            ranking = ranking_combinaciones(
-                probabilidades,
-                top_n=top_n,
+            ranking = ranking_hibrido(
+                probs_posiciones,
+                probs_perfil,
+                top_n,
+                supervivencia,
             )
-            duracion = time.time() - inicio
 
-        st.session_state["ranking_ai"] = ranking
-        st.session_state["probs_ai"] = probabilidades
-        st.session_state["tiempo_ai"] = duracion
+        st.session_state["ranking_ai_v2"] = ranking
+        st.session_state["tiempo_ai_v2"] = time.time() - inicio
 
-    if "ranking_ai" in st.session_state:
-        ranking = st.session_state["ranking_ai"]
+    if "ranking_ai_v2" in st.session_state:
+        ranking = st.session_state["ranking_ai_v2"]
         mejor = ranking.iloc[0]
 
-        p1, p2, p3 = st.columns(3)
-        p1.metric("Mejor clasificado", mejor["Número"])
-        p2.metric("Score IA", f'{mejor["Score IA"]:.4f}')
-        p3.metric(
-            "Tiempo de entrenamiento",
-            f'{st.session_state.get("tiempo_ai", 0):.1f} s',
+        r1, r2, r3 = st.columns(3)
+        r1.metric("Mejor clasificado", mejor["Número"])
+        r2.metric("Score final", f'{mejor["Score final"]:.4f}')
+        r3.metric(
+            "Tiempo",
+            f'{st.session_state.get("tiempo_ai_v2", 0):.1f} s',
         )
 
-        st.dataframe(
-            ranking,
-            use_container_width=True,
-            hide_index=True,
-        )
+        st.dataframe(ranking, use_container_width=True, hide_index=True)
 
         st.download_button(
-            "Descargar ranking IA",
+            "Descargar ranking",
             ranking.to_csv(index=False).encode("utf-8-sig"),
-            file_name="ranking_tris_ai.csv",
+            file_name="ranking_tris_ai_v2.csv",
             mime="text/csv",
         )
 
-        st.info(
-            "El Score IA no es una probabilidad garantizada. Es una puntuación "
-            "derivada de las probabilidades estimadas para cada posición."
-        )
-
-with tab_backtest:
-    st.subheader("Validación temporal de la IA")
-    st.write(
-        "Para cada prueba, el modelo solo ve resultados anteriores. "
-        "Después se comprueba si el resultado real quedó en el Top 100."
-    )
+with tab_bt:
+    st.subheader("Backtesting temporal")
 
     b1, b2, b3 = st.columns(3)
     sorteo_bt = b1.selectbox("Sorteo", SORTEOS, key="bt_sorteo")
@@ -436,11 +539,10 @@ with tab_backtest:
         30,
         10,
         5,
-        help="Random Forest tarda más. Empieza con 10.",
     )
 
     if st.button(
-        "▶ Ejecutar backtesting IA",
+        "▶ Ejecutar backtesting",
         type="primary",
         use_container_width=True,
     ):
@@ -452,24 +554,22 @@ with tab_backtest:
         numeros_bt = preparar_directa4(filtrados_bt, lado_bt)
         fechas_bt = filtrados_bt["fecha"].tolist()
 
-        if len(numeros_bt) < max(300, pruebas + lags + 50):
-            st.error("No hay suficientes resultados para entrenar.")
-        else:
-            inicio = time.time()
-            resultado = ejecutar_backtesting(
-                numeros_bt,
-                fechas_bt,
-                pruebas,
-                lags,
-                max_entrenamiento,
-                arboles,
-                profundidad,
-            )
-            st.session_state["bt_ai"] = resultado
-            st.session_state["bt_ai_tiempo"] = time.time() - inicio
+        inicio = time.time()
+        resultado = ejecutar_backtesting(
+            numeros_bt,
+            fechas_bt,
+            pruebas,
+            lags,
+            max_muestras,
+            arboles,
+            profundidad,
+            supervivencia,
+        )
+        st.session_state["bt_ai_v2"] = resultado
+        st.session_state["bt_ai_v2_tiempo"] = time.time() - inicio
 
-    if "bt_ai" in st.session_state:
-        resultado = st.session_state["bt_ai"]
+    if "bt_ai_v2" in st.session_state:
+        resultado = st.session_state["bt_ai_v2"]
         total = len(resultado)
 
         a10 = int(resultado["Top 10"].sum())
@@ -484,18 +584,14 @@ with tab_backtest:
         q4.metric("Top 100", f"{a100}/{total}", f"{a100 / total * 100:.1f}%")
 
         st.caption(
-            f'Tiempo total: {st.session_state.get("bt_ai_tiempo", 0):.1f} segundos. '
-            "La referencia aleatoria para Top 100 es aproximadamente 1%."
+            f'Tiempo: {st.session_state.get("bt_ai_v2_tiempo", 0):.1f} s. '
+            "Referencia aleatoria Top 100: aproximadamente 1%."
         )
 
         if a100 / total > 0.01:
-            st.success(
-                "En esta muestra, la IA superó la referencia aleatoria del 1%."
-            )
+            st.success("Superó la referencia aleatoria en esta muestra.")
         else:
-            st.warning(
-                "En esta muestra, la IA no superó la referencia aleatoria del 1%."
-            )
+            st.warning("No superó la referencia aleatoria en esta muestra.")
 
         st.dataframe(
             resultado.sort_values("Fecha", ascending=False),
@@ -503,28 +599,22 @@ with tab_backtest:
             hide_index=True,
         )
 
-        st.download_button(
-            "Descargar backtesting IA",
-            resultado.to_csv(index=False).encode("utf-8-sig"),
-            file_name="backtesting_tris_ai.csv",
-            mime="text/csv",
-        )
-
-with tab_modelo:
-    st.subheader("Cómo funciona")
+with tab_explicacion:
     st.write(
-        "Se entrenan cuatro Random Forest independientes: uno para cada "
-        "posición de Directa 4. Cada modelo recibe los últimos sorteos, "
-        "sus dígitos, sumas, paridad, repeticiones y cambios entre posiciones."
+        "La V2 usa dos modelos distintos para cada posición: Random Forest "
+        "y Extra Trees. Sus probabilidades se promedian."
     )
     st.write(
-        "Después calcula 10 probabilidades por posición y combina las cuatro "
-        "para ordenar las 10,000 combinaciones posibles."
+        "Además entrena un modelo separado para predecir el perfil: cantidad "
+        "de pares, dígitos altos, repeticiones, rango de suma y consecutivos."
+    )
+    st.write(
+        "Primero sobreviven las combinaciones con perfil más compatible y "
+        "después se ordenan combinando el score de dígitos y el score del perfil."
     )
     st.warning(
-        "Un sorteo bien diseñado debe comportarse como un proceso aleatorio. "
-        "El aprendizaje automático puede encontrar correlaciones históricas, "
-        "pero no garantiza que se repitan."
+        "El backtesting es el criterio principal. Una mejora visual o un score "
+        "alto no significa que el modelo tenga poder predictivo."
     )
 
 with tab_base:
