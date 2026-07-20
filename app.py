@@ -221,7 +221,6 @@ def crear_modelos(arboles, profundidad, semilla):
                 max_iter=600,
                 class_weight="balanced",
                 C=0.5,
-                multi_class="auto",
                 random_state=semilla + 300,
             )),
         ]),
