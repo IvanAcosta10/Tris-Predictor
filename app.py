@@ -6,7 +6,7 @@ import pandas as pd
 import streamlit as st
 
 st.set_page_config(
-    page_title="TRIS Predictor V3",
+    page_title="TRIS Predictor V5",
     page_icon="🎯",
     layout="wide",
 )
@@ -23,8 +23,7 @@ def leer_csv(origen):
     faltantes = requeridas - set(df.columns)
     if faltantes:
         raise ValueError(
-            "El archivo no contiene las columnas requeridas: "
-            + ", ".join(sorted(faltantes))
+            "Faltan columnas: " + ", ".join(sorted(faltantes))
         )
 
     df = df[["fecha", "sorteo", "numero"]].copy()
@@ -35,43 +34,41 @@ def leer_csv(origen):
         .str.replace(r"\.0$", "", regex=True)
         .str.zfill(5)
     )
+
     df = df.dropna(subset=["fecha"])
     df = df[df["numero"].str.fullmatch(r"\d{5}", na=False)]
     df = df.drop_duplicates(subset=["fecha", "sorteo"], keep="last")
     return df.sort_values(["fecha", "sorteo"]).reset_index(drop=True)
 
 
-def normalizar(contador, claves):
-    valores = np.array([contador.get(k, 0.0) for k in claves], dtype=float)
+def preparar_directa4(df, lado):
+    serie = df["numero"].astype(str).str.zfill(5)
+    if lado == "Primeros 4":
+        return serie.str[:4].tolist()
+    return serie.str[-4:].tolist()
+
+
+def normalizar_diccionario(diccionario, claves):
+    valores = np.array([diccionario.get(k, 0.0) for k in claves], dtype=float)
+
     if valores.max() == valores.min():
         return {k: 0.5 for k in claves}
+
     valores = (valores - valores.min()) / (valores.max() - valores.min())
-    return dict(zip(claves, valores))
+    return {k: float(v) for k, v in zip(claves, valores)}
 
 
-def preparar_directa4(df, lado):
-    numeros = df["numero"].astype(str).str.zfill(5)
-    if lado == "Primeros 4":
-        return numeros.str[:4].tolist()
-    return numeros.str[-4:].tolist()
-
-
-def calcular_ranking(
-    numeros,
-    top_n=30,
-    ventana_reciente=150,
-    peso_recencia=1.5,
-    excluir_vistos=False,
-):
-    if len(numeros) < 10:
-        return pd.DataFrame()
-
+def crear_modelo(numeros, ventana_reciente, peso_recencia):
     cantidad = len(numeros)
-    pesos = np.ones(cantidad)
+    pesos_temporales = np.ones(cantidad, dtype=float)
     ventana = min(ventana_reciente, cantidad)
 
-    if ventana:
-        pesos[-ventana:] = np.linspace(1.0, 1.0 + peso_recencia, ventana)
+    if ventana > 0:
+        pesos_temporales[-ventana:] = np.linspace(
+            1.0,
+            1.0 + peso_recencia,
+            ventana,
+        )
 
     digitos = [str(i) for i in range(10)]
     pares = [f"{i:02d}" for i in range(100)]
@@ -81,34 +78,168 @@ def calcular_ranking(
     frecuencia_pares = [Counter() for _ in range(3)]
     transiciones = [defaultdict(Counter) for _ in range(3)]
 
-    for numero, peso in zip(numeros, pesos):
-        for pos, digito in enumerate(numero):
+    ultima_aparicion_numero = {}
+    ultima_aparicion_digito_posicion = [
+        {d: None for d in digitos}
+        for _ in range(4)
+    ]
+
+    for indice, (numero, peso) in enumerate(zip(numeros, pesos_temporales)):
+        ultima_aparicion_numero[numero] = indice
+
+        for posicion, digito in enumerate(numero):
             frecuencia_global[digito] += peso
-            frecuencia_posicion[pos][digito] += peso
+            frecuencia_posicion[posicion][digito] += peso
+            ultima_aparicion_digito_posicion[posicion][digito] = indice
 
-        for pos in range(3):
-            frecuencia_pares[pos][numero[pos:pos + 2]] += peso
-            transiciones[pos][numero[pos]][numero[pos + 1]] += peso
+        for posicion in range(3):
+            par = numero[posicion:posicion + 2]
+            frecuencia_pares[posicion][par] += peso
+            transiciones[posicion][numero[posicion]][numero[posicion + 1]] += peso
 
-    global_norm = normalizar(frecuencia_global, digitos)
+    global_norm = normalizar_diccionario(frecuencia_global, digitos)
     posicion_norm = [
-        normalizar(contador, digitos)
+        normalizar_diccionario(contador, digitos)
         for contador in frecuencia_posicion
     ]
     pares_norm = [
-        normalizar(contador, pares)
+        normalizar_diccionario(contador, pares)
         for contador in frecuencia_pares
     ]
 
     transiciones_norm = []
-    for pos in range(3):
+    for posicion in range(3):
         por_digito = {}
         for digito in digitos:
-            por_digito[digito] = normalizar(
-                transiciones[pos][digito],
+            por_digito[digito] = normalizar_diccionario(
+                transiciones[posicion][digito],
                 digitos,
             )
         transiciones_norm.append(por_digito)
+
+    # Ausencia de cada dígito por posición.
+    ausencia_posicion = []
+    for posicion in range(4):
+        ausencias = {}
+        for digito in digitos:
+            ultima = ultima_aparicion_digito_posicion[posicion][digito]
+            ausencias[digito] = cantidad if ultima is None else cantidad - 1 - ultima
+        ausencia_posicion.append(
+            normalizar_diccionario(ausencias, digitos)
+        )
+
+    ultimo_numero = numeros[-1] if numeros else "0000"
+
+    return {
+        "global": global_norm,
+        "posicion": posicion_norm,
+        "pares": pares_norm,
+        "transiciones": transiciones_norm,
+        "ausencia_posicion": ausencia_posicion,
+        "ultima_aparicion_numero": ultima_aparicion_numero,
+        "cantidad": cantidad,
+        "ultimo_numero": ultimo_numero,
+    }
+
+
+def calcular_componentes(numero, modelo):
+    d = list(numero)
+
+    posicion = sum(
+        modelo["posicion"][pos][d[pos]]
+        for pos in range(4)
+    ) / 4
+
+    frecuencia = sum(
+        modelo["global"][digito]
+        for digito in d
+    ) / 4
+
+    pares = sum(
+        modelo["pares"][pos][numero[pos:pos + 2]]
+        for pos in range(3)
+    ) / 3
+
+    transiciones = sum(
+        modelo["transiciones"][pos][d[pos]][d[pos + 1]]
+        for pos in range(3)
+    ) / 3
+
+    ausencia = sum(
+        modelo["ausencia_posicion"][pos][d[pos]]
+        for pos in range(4)
+    ) / 4
+
+    repeticion = (4 - len(set(d))) / 3
+
+    espejo = (
+        int(d[0] == d[3]) +
+        int(d[1] == d[2])
+    ) / 2
+
+    ultimo = modelo["ultimo_numero"]
+    coincidencias = sum(
+        int(d[pos] == ultimo[pos])
+        for pos in range(4)
+    )
+    similitud_ultimo = coincidencias / 4
+
+    ultima_aparicion = modelo["ultima_aparicion_numero"].get(numero)
+    if ultima_aparicion is None:
+        ciclo_numero = 1.0
+    else:
+        distancia = modelo["cantidad"] - 1 - ultima_aparicion
+        ciclo_numero = min(distancia / 500, 1.0)
+
+    suma = sum(int(x) for x in d)
+    equilibrio_suma = 1.0 - min(abs(suma - 18) / 18, 1.0)
+
+    pares_impares = sum(int(x) % 2 for x in d)
+    equilibrio_paridad = 1.0 if pares_impares == 2 else 0.5 if pares_impares in (1, 3) else 0.0
+
+    return {
+        "Posición": posicion,
+        "Frecuencia": frecuencia,
+        "Pares": pares,
+        "Transiciones": transiciones,
+        "Ausencia": ausencia,
+        "Ciclo": ciclo_numero,
+        "Repetición": repeticion,
+        "Espejo": espejo,
+        "Similitud último": similitud_ultimo,
+        "Suma": equilibrio_suma,
+        "Paridad": equilibrio_paridad,
+    }
+
+
+def puntuar_componentes(componentes, pesos):
+    total_pesos = sum(pesos.values())
+    if total_pesos <= 0:
+        return 0.0
+
+    puntuacion = sum(
+        componentes[nombre] * peso
+        for nombre, peso in pesos.items()
+    )
+    return puntuacion / total_pesos
+
+
+def calcular_ranking(
+    numeros,
+    top_n,
+    ventana_reciente,
+    peso_recencia,
+    pesos,
+    excluir_vistos=False,
+):
+    if len(numeros) < 10:
+        return pd.DataFrame()
+
+    modelo = crear_modelo(
+        numeros,
+        ventana_reciente=ventana_reciente,
+        peso_recencia=peso_recencia,
+    )
 
     vistos = set(numeros)
     filas = []
@@ -119,51 +250,14 @@ def calcular_ranking(
         if excluir_vistos and numero in vistos:
             continue
 
-        d = list(numero)
-
-        puntuacion_posicion = sum(
-            posicion_norm[pos][d[pos]]
-            for pos in range(4)
-        ) / 4
-
-        puntuacion_global = sum(
-            global_norm[digito]
-            for digito in d
-        ) / 4
-
-        puntuacion_pares = sum(
-            pares_norm[pos][numero[pos:pos + 2]]
-            for pos in range(3)
-        ) / 3
-
-        puntuacion_transiciones = sum(
-            transiciones_norm[pos][d[pos]][d[pos + 1]]
-            for pos in range(3)
-        ) / 3
-
-        repeticion = (4 - len(set(d))) / 3
-        espejo = (
-            int(d[0] == d[3]) +
-            int(d[1] == d[2])
-        ) / 2
-
-        puntuacion = (
-            0.38 * puntuacion_posicion
-            + 0.18 * puntuacion_global
-            + 0.22 * puntuacion_pares
-            + 0.17 * puntuacion_transiciones
-            + 0.03 * repeticion
-            + 0.02 * espejo
-        )
+        componentes = calcular_componentes(numero, modelo)
+        puntuacion = puntuar_componentes(componentes, pesos)
 
         filas.append(
             {
                 "Número": numero,
                 "Puntuación": puntuacion,
-                "Posición": puntuacion_posicion,
-                "Pares": puntuacion_pares,
-                "Transiciones": puntuacion_transiciones,
-                "Frecuencia": puntuacion_global,
+                **componentes,
             }
         )
 
@@ -174,117 +268,155 @@ def calcular_ranking(
         .reset_index(drop=True)
     )
 
-    ranking.insert(0, "Ranking", np.arange(1, len(ranking) + 1))
+    ranking.insert(0, "Ranking", range(1, len(ranking) + 1))
 
-    for columna in [
+    columnas_score = [
         "Puntuación",
         "Posición",
+        "Frecuencia",
         "Pares",
         "Transiciones",
-        "Frecuencia",
-    ]:
+        "Ausencia",
+        "Ciclo",
+        "Repetición",
+        "Espejo",
+        "Similitud último",
+        "Suma",
+        "Paridad",
+    ]
+
+    for columna in columnas_score:
         ranking[columna] = (ranking[columna] * 100).round(2)
 
     return ranking
 
 
-def tabla_frecuencias(numeros):
+def ejecutar_backtesting(
+    numeros,
+    fechas,
+    cantidad_pruebas,
+    ventana,
+    recencia,
+    pesos,
+):
+    inicio = len(numeros) - cantidad_pruebas
     filas = []
-    for posicion in range(4):
-        contador = Counter(numero[posicion] for numero in numeros)
-        total = sum(contador.values())
+    barra = st.progress(0)
+    estado = st.empty()
 
-        for digito in range(10):
-            valor = contador.get(str(digito), 0)
-            filas.append(
-                {
-                    "Posición": posicion + 1,
-                    "Dígito": str(digito),
-                    "Apariciones": valor,
-                    "Porcentaje": round(valor / total * 100, 2) if total else 0,
-                }
-            )
+    for contador, indice in enumerate(
+        range(inicio, len(numeros)),
+        start=1,
+    ):
+        entrenamiento = numeros[:indice]
+        real = numeros[indice]
 
+        ranking = calcular_ranking(
+            entrenamiento,
+            top_n=100,
+            ventana_reciente=ventana,
+            peso_recencia=recencia,
+            pesos=pesos,
+            excluir_vistos=False,
+        )
+
+        top100 = ranking["Número"].tolist()
+        posicion = top100.index(real) + 1 if real in top100 else None
+
+        filas.append(
+            {
+                "Fecha": fechas[indice],
+                "Resultado real": real,
+                "Ranking": posicion if posicion else "Fuera del Top 100",
+                "Top 10": posicion is not None and posicion <= 10,
+                "Top 20": posicion is not None and posicion <= 20,
+                "Top 50": posicion is not None and posicion <= 50,
+                "Top 100": posicion is not None,
+            }
+        )
+
+        barra.progress(contador / cantidad_pruebas)
+        estado.write(
+            f"Probando {contador} de {cantidad_pruebas}: "
+            f"{pd.to_datetime(fechas[indice]).strftime('%d/%m/%Y')}"
+        )
+
+    barra.empty()
+    estado.empty()
     return pd.DataFrame(filas)
 
 
-st.title("🎯 TRIS Predictor V4")
-st.caption("Analizador estadístico de Directa 4 usando tu histórico descargado.")
+st.title("🎯 TRIS Predictor V5")
+st.caption("Motor modular de puntuación y validación histórica.")
 
 archivo_subido = st.sidebar.file_uploader(
     "Cargar tris_historico.csv",
     type=["csv"],
-    help="Sube el archivo generado por actualizar_tris.py.",
 )
 
 try:
     if archivo_subido is not None:
         datos = leer_csv(archivo_subido)
-        origen = "Archivo cargado manualmente"
     elif LOCAL_CSV.exists():
         datos = leer_csv(LOCAL_CSV)
-        origen = "Archivo incluido en la aplicación"
     else:
         datos = pd.DataFrame()
-        origen = None
 except Exception as error:
     st.error(f"No se pudo leer el archivo: {error}")
     st.stop()
 
 if datos.empty:
-    st.warning(
-        "Falta el archivo de resultados. Usa el panel lateral para subir "
-        "`tris_historico.csv`."
-    )
+    st.warning("Sube el archivo `tris_historico.csv` desde el panel lateral.")
     st.stop()
 
 st.sidebar.success(f"{len(datos):,} resultados cargados")
-st.sidebar.caption(origen)
-
-ultima_fecha = datos["fecha"].max()
-primera_fecha = datos["fecha"].min()
 
 m1, m2, m3 = st.columns(3)
-m1.metric("Resultados cargados", f"{len(datos):,}")
-m2.metric("Primera fecha", primera_fecha.strftime("%d/%m/%Y"))
-m3.metric("Última fecha", ultima_fecha.strftime("%d/%m/%Y"))
+m1.metric("Resultados", f"{len(datos):,}")
+m2.metric("Primera fecha", datos["fecha"].min().strftime("%d/%m/%Y"))
+m3.metric("Última fecha", datos["fecha"].max().strftime("%d/%m/%Y"))
 
-tab_prediccion, tab_backtest, tab_analisis, tab_base = st.tabs(
-    [
-        "🎯 Ranking Directa 4",
-        "🧪 Backtesting",
-        "📊 Análisis",
-        "🗂️ Base de datos",
-    ]
+tab_ranking, tab_backtest, tab_base = st.tabs(
+    ["🎯 Ranking", "🧪 Backtesting", "🗂️ Base de datos"]
 )
 
-with tab_prediccion:
-    c1, c2, c3 = st.columns(3)
+with st.sidebar.expander("⚙️ Pesos del modelo", expanded=True):
+    peso_posicion = st.slider("Posición", 0.0, 1.0, 0.25, 0.01)
+    peso_frecuencia = st.slider("Frecuencia", 0.0, 1.0, 0.10, 0.01)
+    peso_pares = st.slider("Pares", 0.0, 1.0, 0.15, 0.01)
+    peso_transiciones = st.slider("Transiciones", 0.0, 1.0, 0.15, 0.01)
+    peso_ausencia = st.slider("Ausencia", 0.0, 1.0, 0.10, 0.01)
+    peso_ciclo = st.slider("Ciclo del número", 0.0, 1.0, 0.10, 0.01)
+    peso_repeticion = st.slider("Repetición", 0.0, 1.0, 0.03, 0.01)
+    peso_espejo = st.slider("Espejo", 0.0, 1.0, 0.02, 0.01)
+    peso_similitud = st.slider("Similitud con último", 0.0, 1.0, 0.03, 0.01)
+    peso_suma = st.slider("Equilibrio de suma", 0.0, 1.0, 0.04, 0.01)
+    peso_paridad = st.slider("Paridad", 0.0, 1.0, 0.03, 0.01)
 
+pesos = {
+    "Posición": peso_posicion,
+    "Frecuencia": peso_frecuencia,
+    "Pares": peso_pares,
+    "Transiciones": peso_transiciones,
+    "Ausencia": peso_ausencia,
+    "Ciclo": peso_ciclo,
+    "Repetición": peso_repeticion,
+    "Espejo": peso_espejo,
+    "Similitud último": peso_similitud,
+    "Suma": peso_suma,
+    "Paridad": peso_paridad,
+}
+
+with tab_ranking:
+    c1, c2, c3 = st.columns(3)
     sorteo = c1.selectbox("Sorteo", SORTEOS)
     lado = c2.selectbox("Directa 4", ["Últimos 4", "Primeros 4"])
     top_n = c3.slider("Cantidad de candidatos", 10, 100, 30, 10)
 
     c4, c5, c6 = st.columns(3)
-
-    ventana = c4.slider(
-        "Resultados recientes con mayor peso",
-        20,
-        500,
-        150,
-        10,
-    )
-    recencia = c5.slider(
-        "Peso de resultados recientes",
-        0.0,
-        3.0,
-        1.5,
-        0.1,
-    )
-    excluir = c6.checkbox(
-        "Excluir combinaciones ya vistas",
-        value=False,
-    )
+    ventana = c4.slider("Ventana reciente", 20, 500, 150, 10)
+    recencia = c5.slider("Peso de recencia", 0.0, 3.0, 1.5, 0.1)
+    excluir = c6.checkbox("Excluir números ya vistos", value=False)
 
     filtrados = datos[datos["sorteo"] == sorteo].sort_values("fecha")
     numeros = preparar_directa4(filtrados, lado)
@@ -294,23 +426,17 @@ with tab_prediccion:
         top_n=top_n,
         ventana_reciente=ventana,
         peso_recencia=recencia,
+        pesos=pesos,
         excluir_vistos=excluir,
     )
 
-    st.write(
-        f"Analizando **{len(numeros):,} resultados** del sorteo "
-        f"**{sorteo}**."
-    )
-
-    if ranking.empty:
-        st.warning("No hay suficientes resultados para calcular el ranking.")
-    else:
+    if not ranking.empty:
         mejor = ranking.iloc[0]
 
         r1, r2, r3 = st.columns(3)
         r1.metric("Mejor clasificado", mejor["Número"])
         r2.metric("Puntuación interna", f'{mejor["Puntuación"]:.2f}')
-        r3.metric("Candidatos mostrados", len(ranking))
+        r3.metric("Resultados analizados", f"{len(numeros):,}")
 
         st.dataframe(
             ranking,
@@ -321,59 +447,38 @@ with tab_prediccion:
         st.download_button(
             "Descargar ranking CSV",
             ranking.to_csv(index=False).encode("utf-8-sig"),
-            file_name=f"ranking_{sorteo}_{lado}.csv",
+            file_name="ranking_v5.csv",
             mime="text/csv",
         )
 
-        st.info(
-            "La puntuación sirve para ordenar patrones históricos. "
-            "No es una probabilidad real ni garantiza un resultado."
-        )
-
-
 with tab_backtest:
-    st.subheader("Prueba histórica del algoritmo")
-    st.write(
-        "Oculta cada resultado real, genera un Top 100 usando solamente "
-        "los sorteos anteriores y revisa si el ganador habría aparecido."
-    )
+    st.subheader("Validación histórica")
 
-    bt1, bt2, bt3 = st.columns(3)
-    sorteo_bt = bt1.selectbox(
-        "Sorteo",
-        SORTEOS,
-        key="sorteo_backtest",
-    )
-    lado_bt = bt2.selectbox(
+    b1, b2, b3 = st.columns(3)
+    sorteo_bt = b1.selectbox("Sorteo", SORTEOS, key="bt_sorteo")
+    lado_bt = b2.selectbox(
         "Directa 4",
         ["Últimos 4", "Primeros 4"],
-        key="lado_backtest",
+        key="bt_lado",
     )
-    pruebas_bt = bt3.slider(
-        "Últimos sorteos a probar",
-        10,
-        100,
-        30,
-        10,
-        help="Empieza con 30. Una prueba grande tardará más.",
-    )
+    pruebas = b3.slider("Sorteos a probar", 10, 100, 30, 10)
 
-    bt4, bt5 = st.columns(2)
-    ventana_bt = bt4.slider(
-        "Resultados recientes con mayor peso",
+    b4, b5 = st.columns(2)
+    ventana_bt = b4.slider(
+        "Ventana reciente",
         20,
         500,
         150,
         10,
-        key="ventana_backtest",
+        key="bt_ventana",
     )
-    recencia_bt = bt5.slider(
-        "Peso de resultados recientes",
+    recencia_bt = b5.slider(
+        "Peso de recencia",
         0.0,
         3.0,
         1.5,
         0.1,
-        key="recencia_backtest",
+        key="bt_recencia",
     )
 
     if st.button(
@@ -386,183 +491,59 @@ with tab_backtest:
             .sort_values("fecha")
             .reset_index(drop=True)
         )
+
         numeros_bt = preparar_directa4(filtrados_bt, lado_bt)
         fechas_bt = filtrados_bt["fecha"].tolist()
 
-        if len(numeros_bt) < pruebas_bt + 200:
-            st.error("No hay suficientes resultados para esta prueba.")
+        if len(numeros_bt) < pruebas + 200:
+            st.error("No hay suficientes resultados.")
         else:
-            inicio = len(numeros_bt) - pruebas_bt
-            barra = st.progress(0)
-            estado = st.empty()
-            filas_bt = []
-
-            for contador, indice in enumerate(
-                range(inicio, len(numeros_bt)),
-                start=1,
-            ):
-                entrenamiento = numeros_bt[:indice]
-                numero_real = numeros_bt[indice]
-
-                ranking_bt = calcular_ranking(
-                    entrenamiento,
-                    top_n=100,
-                    ventana_reciente=ventana_bt,
-                    peso_recencia=recencia_bt,
-                    excluir_vistos=False,
-                )
-
-                lista_top100 = ranking_bt["Número"].tolist()
-                posicion_real = (
-                    lista_top100.index(numero_real) + 1
-                    if numero_real in lista_top100
-                    else None
-                )
-
-                filas_bt.append(
-                    {
-                        "Fecha": fechas_bt[indice],
-                        "Resultado real": numero_real,
-                        "Ranking": posicion_real if posicion_real else "Fuera del Top 100",
-                        "Top 10": posicion_real is not None and posicion_real <= 10,
-                        "Top 20": posicion_real is not None and posicion_real <= 20,
-                        "Top 50": posicion_real is not None and posicion_real <= 50,
-                        "Top 100": posicion_real is not None,
-                    }
-                )
-
-                barra.progress(contador / pruebas_bt)
-                estado.write(
-                    f"Probando {contador} de {pruebas_bt}: "
-                    f"{pd.to_datetime(fechas_bt[indice]).strftime('%d/%m/%Y')}"
-                )
-
-            barra.empty()
-            estado.empty()
-
-            resultado_bt = pd.DataFrame(filas_bt)
-            st.session_state["resultado_backtest"] = resultado_bt
-
-    if "resultado_backtest" in st.session_state:
-        resultado_bt = st.session_state["resultado_backtest"]
-        total_bt = len(resultado_bt)
-
-        aciertos10 = int(resultado_bt["Top 10"].sum())
-        aciertos20 = int(resultado_bt["Top 20"].sum())
-        aciertos50 = int(resultado_bt["Top 50"].sum())
-        aciertos100 = int(resultado_bt["Top 100"].sum())
-
-        r1, r2, r3, r4 = st.columns(4)
-        r1.metric(
-            "Aciertos Top 10",
-            f"{aciertos10}/{total_bt}",
-            f"{aciertos10 / total_bt * 100:.1f}%",
-        )
-        r2.metric(
-            "Aciertos Top 20",
-            f"{aciertos20}/{total_bt}",
-            f"{aciertos20 / total_bt * 100:.1f}%",
-        )
-        r3.metric(
-            "Aciertos Top 50",
-            f"{aciertos50}/{total_bt}",
-            f"{aciertos50 / total_bt * 100:.1f}%",
-        )
-        r4.metric(
-            "Aciertos Top 100",
-            f"{aciertos100}/{total_bt}",
-            f"{aciertos100 / total_bt * 100:.1f}%",
-        )
-
-        st.caption(
-            "Como referencia, un Top 100 elegido completamente al azar "
-            "cubriría aproximadamente 1% de las 10,000 combinaciones."
-        )
-
-        if aciertos100 / total_bt > 0.01:
-            st.success(
-                "En esta muestra, el Top 100 superó la referencia aleatoria del 1%."
+            resultado = ejecutar_backtesting(
+                numeros_bt,
+                fechas_bt,
+                pruebas,
+                ventana_bt,
+                recencia_bt,
+                pesos,
             )
+            st.session_state["bt_v5"] = resultado
+
+    if "bt_v5" in st.session_state:
+        resultado = st.session_state["bt_v5"]
+        total = len(resultado)
+
+        a10 = int(resultado["Top 10"].sum())
+        a20 = int(resultado["Top 20"].sum())
+        a50 = int(resultado["Top 50"].sum())
+        a100 = int(resultado["Top 100"].sum())
+
+        q1, q2, q3, q4 = st.columns(4)
+        q1.metric("Top 10", f"{a10}/{total}", f"{a10 / total * 100:.1f}%")
+        q2.metric("Top 20", f"{a20}/{total}", f"{a20 / total * 100:.1f}%")
+        q3.metric("Top 50", f"{a50}/{total}", f"{a50 / total * 100:.1f}%")
+        q4.metric("Top 100", f"{a100}/{total}", f"{a100 / total * 100:.1f}%")
+
+        if a100 / total > 0.01:
+            st.success("El Top 100 superó la referencia aleatoria del 1% en esta muestra.")
         else:
-            st.warning(
-                "En esta muestra, el Top 100 no superó claramente "
-                "la referencia aleatoria del 1%."
-            )
+            st.warning("El Top 100 no superó la referencia aleatoria del 1%.")
 
         st.dataframe(
-            resultado_bt.sort_values("Fecha", ascending=False),
+            resultado.sort_values("Fecha", ascending=False),
             use_container_width=True,
             hide_index=True,
         )
 
         st.download_button(
             "Descargar backtesting CSV",
-            resultado_bt.to_csv(index=False).encode("utf-8-sig"),
-            file_name="backtesting_tris.csv",
+            resultado.to_csv(index=False).encode("utf-8-sig"),
+            file_name="backtesting_v5.csv",
             mime="text/csv",
         )
-
-
-with tab_analisis:
-    c1, c2 = st.columns(2)
-    sorteo_analisis = c1.selectbox(
-        "Sorteo para analizar",
-        SORTEOS,
-        key="sorteo_analisis",
-    )
-    lado_analisis = c2.selectbox(
-        "Sección de Directa 4",
-        ["Últimos 4", "Primeros 4"],
-        key="lado_analisis",
-    )
-
-    filtrados = datos[datos["sorteo"] == sorteo_analisis].sort_values("fecha")
-    numeros = preparar_directa4(filtrados, lado_analisis)
-    frecuencias = tabla_frecuencias(numeros)
-
-    pivot = frecuencias.pivot(
-        index="Dígito",
-        columns="Posición",
-        values="Porcentaje",
-    )
-
-    st.subheader("Frecuencia porcentual por posición")
-    st.dataframe(pivot, use_container_width=True)
-
-    globales = Counter("".join(numeros))
-    global_df = pd.DataFrame(
-        {
-            "Dígito": [str(i) for i in range(10)],
-            "Apariciones": [globales.get(str(i), 0) for i in range(10)],
-        }
-    ).sort_values("Apariciones", ascending=False)
-
-    st.subheader("Dígitos más frecuentes")
-    st.bar_chart(global_df.set_index("Dígito"))
-
-    st.subheader("Últimos 30 resultados analizados")
-    recientes = filtrados.sort_values("fecha", ascending=False).head(30).copy()
-    recientes["Directa 4"] = preparar_directa4(
-        recientes.sort_values("fecha"),
-        lado_analisis,
-    )[::-1]
-
-    st.dataframe(
-        recientes[["fecha", "sorteo", "numero", "Directa 4"]],
-        use_container_width=True,
-        hide_index=True,
-    )
 
 with tab_base:
     st.dataframe(
         datos.sort_values("fecha", ascending=False),
         use_container_width=True,
         hide_index=True,
-    )
-
-    st.download_button(
-        "Descargar base completa",
-        datos.to_csv(index=False).encode("utf-8-sig"),
-        file_name="tris_historico_limpio.csv",
-        mime="text/csv",
     )
