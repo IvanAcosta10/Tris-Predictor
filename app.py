@@ -1,14 +1,17 @@
 
 from pathlib import Path
-from collections import Counter, defaultdict
+import itertools
+import time
 
 import numpy as np
 import pandas as pd
 import streamlit as st
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import log_loss
 
 st.set_page_config(
-    page_title="TRIS Predictor V7",
-    page_icon="🎯",
+    page_title="TRIS AI V1",
+    page_icon="🧠",
     layout="wide",
 )
 
@@ -19,9 +22,9 @@ SORTEOS = ["Medio Día", "De las Tres", "Extra", "De las Siete", "Clásico"]
 @st.cache_data
 def leer_csv(origen):
     df = pd.read_csv(origen, dtype={"numero": str})
-
     requeridas = {"fecha", "sorteo", "numero"}
     faltantes = requeridas - set(df.columns)
+
     if faltantes:
         raise ValueError(
             "Faltan columnas: " + ", ".join(sorted(faltantes))
@@ -35,7 +38,6 @@ def leer_csv(origen):
         .str.replace(r"\.0$", "", regex=True)
         .str.zfill(5)
     )
-
     df = df.dropna(subset=["fecha"])
     df = df[df["numero"].str.fullmatch(r"\d{5}", na=False)]
     df = df.drop_duplicates(subset=["fecha", "sorteo"], keep="last")
@@ -49,444 +51,165 @@ def preparar_directa4(df, lado):
     return serie.str[-4:].tolist()
 
 
-def normalizar_diccionario(diccionario, claves):
-    valores = np.array([diccionario.get(k, 0.0) for k in claves], dtype=float)
+def caracteristicas_numero(numero):
+    d = np.array([int(x) for x in numero], dtype=float)
+    return [
+        d.sum(),
+        d.mean(),
+        d.std(),
+        len(set(numero)),
+        sum(x % 2 == 0 for x in d),
+        sum(x >= 5 for x in d),
+        abs(d[0] - d[1]),
+        abs(d[1] - d[2]),
+        abs(d[2] - d[3]),
+        int(d[0] == d[3]),
+        int(d[1] == d[2]),
+    ]
 
-    if valores.max() == valores.min():
-        return {k: 0.5 for k in claves}
 
-    valores = (valores - valores.min()) / (valores.max() - valores.min())
-    return {k: float(v) for k, v in zip(claves, valores)}
+def crear_dataset(numeros, lags=10):
+    X = []
+    y = [[], [], [], []]
+
+    for indice in range(lags, len(numeros)):
+        historial = numeros[indice - lags:indice]
+        fila = []
+
+        # Dígitos de los últimos sorteos.
+        for numero in historial:
+            fila.extend(int(x) for x in numero)
+
+        # Características de cada sorteo anterior.
+        for numero in historial:
+            fila.extend(caracteristicas_numero(numero))
+
+        # Cambios entre sorteos consecutivos.
+        for j in range(1, len(historial)):
+            anterior = historial[j - 1]
+            actual = historial[j]
+            fila.extend(
+                (int(actual[pos]) - int(anterior[pos])) % 10
+                for pos in range(4)
+            )
+
+        X.append(fila)
+
+        objetivo = numeros[indice]
+        for posicion in range(4):
+            y[posicion].append(int(objetivo[posicion]))
+
+    return np.asarray(X, dtype=np.float32), [
+        np.asarray(valores, dtype=np.int64)
+        for valores in y
+    ]
 
 
-def crear_modelo(numeros, ventana_reciente, peso_recencia):
-    cantidad = len(numeros)
-    pesos_temporales = np.ones(cantidad, dtype=float)
-    ventana = min(ventana_reciente, cantidad)
+def crear_fila_prediccion(numeros, lags=10):
+    historial = numeros[-lags:]
+    fila = []
 
-    if ventana > 0:
-        pesos_temporales[-ventana:] = np.linspace(
-            1.0,
-            1.0 + peso_recencia,
-            ventana,
+    for numero in historial:
+        fila.extend(int(x) for x in numero)
+
+    for numero in historial:
+        fila.extend(caracteristicas_numero(numero))
+
+    for j in range(1, len(historial)):
+        anterior = historial[j - 1]
+        actual = historial[j]
+        fila.extend(
+            (int(actual[pos]) - int(anterior[pos])) % 10
+            for pos in range(4)
         )
 
-    digitos = [str(i) for i in range(10)]
-    pares = [f"{i:02d}" for i in range(100)]
-
-    frecuencia_global = Counter()
-    frecuencia_posicion = [Counter() for _ in range(4)]
-    frecuencia_pares = [Counter() for _ in range(3)]
-    transiciones = [defaultdict(Counter) for _ in range(3)]
-
-    # Aprende cómo cambia cada posición de un sorteo al siguiente.
-    siguiente_por_digito = [defaultdict(Counter) for _ in range(4)]
-    delta_por_posicion = [Counter() for _ in range(4)]
-    coincidencias_con_anterior = Counter()
-
-    ultima_aparicion_numero = {}
-    ultima_aparicion_digito_posicion = [
-        {d: None for d in digitos}
-        for _ in range(4)
-    ]
-
-    for indice, (numero, peso) in enumerate(zip(numeros, pesos_temporales)):
-        ultima_aparicion_numero[numero] = indice
-
-        if indice > 0:
-            anterior = numeros[indice - 1]
-            coincidencias = 0
-
-            for posicion in range(4):
-                digito_anterior = anterior[posicion]
-                digito_actual = numero[posicion]
-
-                siguiente_por_digito[posicion][digito_anterior][digito_actual] += peso
-
-                delta = (
-                    int(digito_actual) - int(digito_anterior)
-                ) % 10
-                delta_por_posicion[posicion][str(delta)] += peso
-
-                if digito_actual == digito_anterior:
-                    coincidencias += 1
-
-            coincidencias_con_anterior[str(coincidencias)] += peso
-
-        for posicion, digito in enumerate(numero):
-            frecuencia_global[digito] += peso
-            frecuencia_posicion[posicion][digito] += peso
-            ultima_aparicion_digito_posicion[posicion][digito] = indice
-
-        for posicion in range(3):
-            par = numero[posicion:posicion + 2]
-            frecuencia_pares[posicion][par] += peso
-            transiciones[posicion][numero[posicion]][numero[posicion + 1]] += peso
-
-    global_norm = normalizar_diccionario(frecuencia_global, digitos)
-    posicion_norm = [
-        normalizar_diccionario(contador, digitos)
-        for contador in frecuencia_posicion
-    ]
-    pares_norm = [
-        normalizar_diccionario(contador, pares)
-        for contador in frecuencia_pares
-    ]
-
-    transiciones_norm = []
-    for posicion in range(3):
-        por_digito = {}
-        for digito in digitos:
-            por_digito[digito] = normalizar_diccionario(
-                transiciones[posicion][digito],
-                digitos,
-            )
-        transiciones_norm.append(por_digito)
-
-    # Ausencia de cada dígito por posición.
-    ausencia_posicion = []
-    for posicion in range(4):
-        ausencias = {}
-        for digito in digitos:
-            ultima = ultima_aparicion_digito_posicion[posicion][digito]
-            ausencias[digito] = cantidad if ultima is None else cantidad - 1 - ultima
-        ausencia_posicion.append(
-            normalizar_diccionario(ausencias, digitos)
-        )
-
-    siguiente_norm = []
-    for posicion in range(4):
-        por_digito = {}
-        for digito in digitos:
-            por_digito[digito] = normalizar_diccionario(
-                siguiente_por_digito[posicion][digito],
-                digitos,
-            )
-        siguiente_norm.append(por_digito)
-
-    delta_norm = [
-        normalizar_diccionario(contador, digitos)
-        for contador in delta_por_posicion
-    ]
-
-    coincidencias_norm = normalizar_diccionario(
-        coincidencias_con_anterior,
-        [str(i) for i in range(5)],
-    )
-
-    ultimo_numero = numeros[-1] if numeros else "0000"
-
-    return {
-        "global": global_norm,
-        "posicion": posicion_norm,
-        "pares": pares_norm,
-        "transiciones": transiciones_norm,
-        "ausencia_posicion": ausencia_posicion,
-        "ultima_aparicion_numero": ultima_aparicion_numero,
-        "cantidad": cantidad,
-        "ultimo_numero": ultimo_numero,
-        "siguiente_por_digito": siguiente_norm,
-        "delta_por_posicion": delta_norm,
-        "coincidencias_con_anterior": coincidencias_norm,
-    }
+    return np.asarray([fila], dtype=np.float32)
 
 
-def calcular_componentes(numero, modelo):
-    d = list(numero)
-
-    posicion = sum(
-        modelo["posicion"][pos][d[pos]]
-        for pos in range(4)
-    ) / 4
-
-    frecuencia = sum(
-        modelo["global"][digito]
-        for digito in d
-    ) / 4
-
-    pares = sum(
-        modelo["pares"][pos][numero[pos:pos + 2]]
-        for pos in range(3)
-    ) / 3
-
-    transiciones = sum(
-        modelo["transiciones"][pos][d[pos]][d[pos + 1]]
-        for pos in range(3)
-    ) / 3
-
-    ausencia = sum(
-        modelo["ausencia_posicion"][pos][d[pos]]
-        for pos in range(4)
-    ) / 4
-
-    repeticion = (4 - len(set(d))) / 3
-
-    espejo = (
-        int(d[0] == d[3]) +
-        int(d[1] == d[2])
-    ) / 2
-
-    ultimo = modelo["ultimo_numero"]
-    coincidencias = sum(
-        int(d[pos] == ultimo[pos])
-        for pos in range(4)
-    )
-    similitud_ultimo = coincidencias / 4
-
-    # Probabilidad condicional empírica:
-    # dado el dígito anterior en cada posición, qué dígito tendió a seguir.
-    influencia_ultimo = sum(
-        modelo["siguiente_por_digito"][pos][ultimo[pos]][d[pos]]
-        for pos in range(4)
-    ) / 4
-
-    # Cambios modulares observados, por ejemplo 7 -> 2 equivale a +5 módulo 10.
-    patron_delta = sum(
-        modelo["delta_por_posicion"][pos][
-            str((int(d[pos]) - int(ultimo[pos])) % 10)
-        ]
-        for pos in range(4)
-    ) / 4
-
-    # Cantidad histórica de posiciones que suelen conservarse entre sorteos.
-    patron_coincidencias = modelo["coincidencias_con_anterior"][
-        str(coincidencias)
-    ]
-
-    ultima_aparicion = modelo["ultima_aparicion_numero"].get(numero)
-    if ultima_aparicion is None:
-        ciclo_numero = 1.0
-    else:
-        distancia = modelo["cantidad"] - 1 - ultima_aparicion
-        ciclo_numero = min(distancia / 500, 1.0)
-
-    suma = sum(int(x) for x in d)
-    equilibrio_suma = 1.0 - min(abs(suma - 18) / 18, 1.0)
-
-    pares_impares = sum(int(x) % 2 for x in d)
-    equilibrio_paridad = 1.0 if pares_impares == 2 else 0.5 if pares_impares in (1, 3) else 0.0
-
-    return {
-        "Posición": posicion,
-        "Frecuencia": frecuencia,
-        "Pares": pares,
-        "Transiciones": transiciones,
-        "Ausencia": ausencia,
-        "Ciclo": ciclo_numero,
-        "Repetición": repeticion,
-        "Espejo": espejo,
-        "Similitud último": similitud_ultimo,
-        "Influencia último": influencia_ultimo,
-        "Patrón delta": patron_delta,
-        "Coincidencias históricas": patron_coincidencias,
-        "Suma": equilibrio_suma,
-        "Paridad": equilibrio_paridad,
-    }
-
-
-def puntuar_componentes(componentes, pesos):
-    total_pesos = sum(pesos.values())
-    if total_pesos <= 0:
-        return 0.0
-
-    puntuacion = sum(
-        componentes[nombre] * peso
-        for nombre, peso in pesos.items()
-    )
-    return puntuacion / total_pesos
-
-
-
-def perfil_numero(numero):
-    digitos = [int(x) for x in numero]
-    pares = sum(d % 2 == 0 for d in digitos)
-    impares = 4 - pares
-    suma = sum(digitos)
-    repetidos = 4 - len(set(numero))
-    empieza_cero = numero[0] == "0"
-    consecutivos = sum(
-        abs(digitos[i] - digitos[i + 1]) == 1
-        for i in range(3)
-    )
-    altos = sum(d >= 5 for d in digitos)
-    bajos = 4 - altos
-
-    return {
-        "pares": pares,
-        "impares": impares,
-        "suma": suma,
-        "repetidos": repetidos,
-        "empieza_cero": empieza_cero,
-        "consecutivos": consecutivos,
-        "altos": altos,
-        "bajos": bajos,
-    }
-
-
-def aprender_perfil(numeros, ventana_perfil=200):
-    muestra = numeros[-min(ventana_perfil, len(numeros)):]
-    perfiles = [perfil_numero(numero) for numero in muestra]
-
-    if not perfiles:
-        return None
-
-    df = pd.DataFrame(perfiles)
-
-    conteo_pares = df["pares"].value_counts(normalize=True).to_dict()
-    conteo_repetidos = df["repetidos"].value_counts(normalize=True).to_dict()
-    conteo_altos = df["altos"].value_counts(normalize=True).to_dict()
-    conteo_consecutivos = df["consecutivos"].value_counts(normalize=True).to_dict()
-
-    suma_media = float(df["suma"].mean())
-    suma_std = float(df["suma"].std(ddof=0))
-    if suma_std == 0:
-        suma_std = 1.0
-
-    prob_cero = float(df["empieza_cero"].mean())
-
-    return {
-        "pares": conteo_pares,
-        "repetidos": conteo_repetidos,
-        "altos": conteo_altos,
-        "consecutivos": conteo_consecutivos,
-        "suma_media": suma_media,
-        "suma_std": suma_std,
-        "prob_cero": prob_cero,
-    }
-
-
-def score_perfil(numero, modelo_perfil):
-    perfil = perfil_numero(numero)
-
-    score_pares = modelo_perfil["pares"].get(perfil["pares"], 0.0)
-    score_repetidos = modelo_perfil["repetidos"].get(perfil["repetidos"], 0.0)
-    score_altos = modelo_perfil["altos"].get(perfil["altos"], 0.0)
-    score_consecutivos = modelo_perfil["consecutivos"].get(perfil["consecutivos"], 0.0)
-
-    z = abs(perfil["suma"] - modelo_perfil["suma_media"]) / modelo_perfil["suma_std"]
-    score_suma = max(0.0, 1.0 - min(z / 3.0, 1.0))
-
-    score_cero = (
-        modelo_perfil["prob_cero"]
-        if perfil["empieza_cero"]
-        else 1.0 - modelo_perfil["prob_cero"]
-    )
-
-    total = (
-        0.24 * score_pares
-        + 0.22 * score_repetidos
-        + 0.18 * score_altos
-        + 0.10 * score_consecutivos
-        + 0.20 * score_suma
-        + 0.06 * score_cero
-    )
-
-    return total, perfil
-
-
-def calcular_ranking(
+def crear_modelos(
     numeros,
-    top_n,
-    ventana_reciente,
-    peso_recencia,
-    pesos,
-    excluir_vistos=False,
-    usar_filtro_perfil=True,
-    ventana_perfil=200,
-    porcentaje_supervivencia=5,
+    lags=10,
+    max_entrenamiento=3000,
+    arboles=150,
+    profundidad=12,
+    semilla=42,
 ):
-    if len(numeros) < 10:
-        return pd.DataFrame()
+    X, ys = crear_dataset(numeros, lags=lags)
 
-    modelo = crear_modelo(
-        numeros,
-        ventana_reciente=ventana_reciente,
-        peso_recencia=peso_recencia,
-    )
+    if len(X) < 200:
+        raise ValueError("No hay suficientes sorteos para entrenar.")
 
-    vistos = set(numeros)
+    if len(X) > max_entrenamiento:
+        X = X[-max_entrenamiento:]
+        ys = [y[-max_entrenamiento:] for y in ys]
+
+    modelos = []
+
+    for posicion in range(4):
+        modelo = RandomForestClassifier(
+            n_estimators=arboles,
+            max_depth=profundidad,
+            min_samples_leaf=3,
+            max_features="sqrt",
+            class_weight="balanced_subsample",
+            random_state=semilla + posicion,
+            n_jobs=-1,
+        )
+        modelo.fit(X, ys[posicion])
+        modelos.append(modelo)
+
+    return modelos
+
+
+def probabilidades_posicion(modelos, numeros, lags):
+    fila = crear_fila_prediccion(numeros, lags=lags)
+    probabilidades = []
+
+    for modelo in modelos:
+        probs_modelo = modelo.predict_proba(fila)[0]
+        probs = np.full(10, 1e-9, dtype=float)
+
+        for clase, prob in zip(modelo.classes_, probs_modelo):
+            probs[int(clase)] = float(prob)
+
+        probs = probs / probs.sum()
+        probabilidades.append(probs)
+
+    return probabilidades
+
+
+def ranking_combinaciones(probabilidades, top_n=100):
     filas = []
 
-    modelo_perfil = aprender_perfil(
-        numeros,
-        ventana_perfil=ventana_perfil,
-    )
+    for digitos in itertools.product(range(10), repeat=4):
+        numero = "".join(str(x) for x in digitos)
+        probs = [
+            probabilidades[pos][digitos[pos]]
+            for pos in range(4)
+        ]
 
-    for valor in range(10000):
-        numero = f"{valor:04d}"
+        # Producto geométrico para evitar que una posición domine demasiado.
+        score = float(np.prod(probs) ** 0.25)
 
-        if excluir_vistos and numero in vistos:
-            continue
-
-        componentes = calcular_componentes(numero, modelo)
-        puntuacion_base = puntuar_componentes(componentes, pesos)
-
-        if usar_filtro_perfil and modelo_perfil is not None:
-            perfil_score, perfil = score_perfil(numero, modelo_perfil)
-        else:
-            perfil_score = 1.0
-            perfil = perfil_numero(numero)
-
-        puntuacion = (
-            0.55 * puntuacion_base
-            + 0.45 * perfil_score
-        )
-
-        filas.append(
-            {
-                "Número": numero,
-                "Puntuación": puntuacion,
-                "Score perfil": perfil_score,
-                "Pares perfil": perfil["pares"],
-                "Suma perfil": perfil["suma"],
-                "Repetidos perfil": perfil["repetidos"],
-                **componentes,
-            }
-        )
-
-    df_filas = pd.DataFrame(filas)
-
-    if usar_filtro_perfil and not df_filas.empty:
-        limite = max(
-            top_n,
-            int(len(df_filas) * porcentaje_supervivencia / 100)
-        )
-        df_filas = (
-            df_filas
-            .sort_values("Score perfil", ascending=False)
-            .head(limite)
-        )
+        filas.append({
+            "Número": numero,
+            "Score IA": score,
+            "P1": probs[0],
+            "P2": probs[1],
+            "P3": probs[2],
+            "P4": probs[3],
+        })
 
     ranking = (
-        df_filas
-        .sort_values("Puntuación", ascending=False)
+        pd.DataFrame(filas)
+        .sort_values("Score IA", ascending=False)
         .head(top_n)
         .reset_index(drop=True)
     )
-
     ranking.insert(0, "Ranking", range(1, len(ranking) + 1))
 
-    columnas_score = [
-        "Puntuación",
-        "Posición",
-        "Frecuencia",
-        "Pares",
-        "Transiciones",
-        "Ausencia",
-        "Ciclo",
-        "Repetición",
-        "Espejo",
-        "Similitud último",
-        "Influencia último",
-        "Patrón delta",
-        "Coincidencias históricas",
-        "Suma",
-        "Paridad",
-        "Score perfil",
-    ]
-
-    for columna in columnas_score:
-        ranking[columna] = (ranking[columna] * 100).round(2)
+    for columna in ["Score IA", "P1", "P2", "P3", "P4"]:
+        ranking[columna] = (ranking[columna] * 100).round(4)
 
     return ranking
 
@@ -494,56 +217,58 @@ def calcular_ranking(
 def ejecutar_backtesting(
     numeros,
     fechas,
-    cantidad_pruebas,
-    ventana,
-    recencia,
-    pesos,
-    usar_filtro_perfil,
-    ventana_perfil,
-    porcentaje_supervivencia,
+    pruebas,
+    lags,
+    max_entrenamiento,
+    arboles,
+    profundidad,
 ):
-    inicio = len(numeros) - cantidad_pruebas
+    inicio = len(numeros) - pruebas
     filas = []
     barra = st.progress(0)
     estado = st.empty()
 
-    for contador, indice in enumerate(
-        range(inicio, len(numeros)),
-        start=1,
-    ):
+    for contador, indice in enumerate(range(inicio, len(numeros)), start=1):
         entrenamiento = numeros[:indice]
         real = numeros[indice]
 
-        ranking = calcular_ranking(
+        modelos = crear_modelos(
             entrenamiento,
-            top_n=100,
-            ventana_reciente=ventana,
-            peso_recencia=recencia,
-            pesos=pesos,
-            excluir_vistos=False,
-            usar_filtro_perfil=usar_filtro_perfil,
-            ventana_perfil=ventana_perfil,
-            porcentaje_supervivencia=porcentaje_supervivencia,
+            lags=lags,
+            max_entrenamiento=max_entrenamiento,
+            arboles=arboles,
+            profundidad=profundidad,
+            semilla=1000 + indice,
         )
-
+        probabilidades = probabilidades_posicion(
+            modelos,
+            entrenamiento,
+            lags,
+        )
+        ranking = ranking_combinaciones(probabilidades, top_n=100)
         top100 = ranking["Número"].tolist()
+
         posicion = top100.index(real) + 1 if real in top100 else None
 
-        filas.append(
-            {
-                "Fecha": fechas[indice],
-                "Resultado real": real,
-                "Ranking": posicion if posicion else "Fuera del Top 100",
-                "Top 10": posicion is not None and posicion <= 10,
-                "Top 20": posicion is not None and posicion <= 20,
-                "Top 50": posicion is not None and posicion <= 50,
-                "Top 100": posicion is not None,
-            }
-        )
+        prob_real = np.prod([
+            probabilidades[pos][int(real[pos])]
+            for pos in range(4)
+        ]) ** 0.25
 
-        barra.progress(contador / cantidad_pruebas)
+        filas.append({
+            "Fecha": fechas[indice],
+            "Resultado real": real,
+            "Ranking": posicion if posicion else "Fuera del Top 100",
+            "Score real": round(float(prob_real) * 100, 4),
+            "Top 10": posicion is not None and posicion <= 10,
+            "Top 20": posicion is not None and posicion <= 20,
+            "Top 50": posicion is not None and posicion <= 50,
+            "Top 100": posicion is not None,
+        })
+
+        barra.progress(contador / pruebas)
         estado.write(
-            f"Probando {contador} de {cantidad_pruebas}: "
+            f"Entrenando y probando {contador} de {pruebas}: "
             f"{pd.to_datetime(fechas[indice]).strftime('%d/%m/%Y')}"
         )
 
@@ -552,8 +277,11 @@ def ejecutar_backtesting(
     return pd.DataFrame(filas)
 
 
-st.title("🎯 TRIS Predictor V7")
-st.caption("Filtro inteligente por perfil antes del ranking estadístico.")
+st.title("🧠 TRIS AI V1")
+st.caption(
+    "Random Forest temporal: aprende de secuencias anteriores y estima "
+    "cada dígito de la siguiente Directa 4."
+)
 
 archivo_subido = st.sidebar.file_uploader(
     "Cargar tris_historico.csv",
@@ -572,98 +300,103 @@ except Exception as error:
     st.stop()
 
 if datos.empty:
-    st.warning("Sube el archivo `tris_historico.csv` desde el panel lateral.")
+    st.warning("Sube `tris_historico.csv` desde el panel lateral.")
     st.stop()
 
 st.sidebar.success(f"{len(datos):,} resultados cargados")
+
+with st.sidebar.expander("⚙️ Configuración IA", expanded=True):
+    lags = st.slider(
+        "Sorteos anteriores usados",
+        5,
+        30,
+        10,
+        1,
+    )
+    max_entrenamiento = st.slider(
+        "Máximo de muestras de entrenamiento",
+        500,
+        4000,
+        2500,
+        250,
+    )
+    arboles = st.slider(
+        "Árboles por modelo",
+        50,
+        300,
+        120,
+        10,
+    )
+    profundidad = st.slider(
+        "Profundidad máxima",
+        4,
+        20,
+        10,
+        1,
+    )
 
 m1, m2, m3 = st.columns(3)
 m1.metric("Resultados", f"{len(datos):,}")
 m2.metric("Primera fecha", datos["fecha"].min().strftime("%d/%m/%Y"))
 m3.metric("Última fecha", datos["fecha"].max().strftime("%d/%m/%Y"))
 
-tab_ranking, tab_backtest, tab_perfil, tab_base = st.tabs(
-    ["🎯 Ranking", "🧪 Backtesting", "🧬 Perfil", "🗂️ Base de datos"]
+tab_prediccion, tab_backtest, tab_modelo, tab_base = st.tabs(
+    ["🎯 Predicción IA", "🧪 Backtesting IA", "🔍 Modelo", "🗂️ Base"]
 )
 
-with st.sidebar.expander("⚙️ Pesos del modelo", expanded=True):
-    peso_posicion = st.slider("Posición", 0.0, 1.0, 0.25, 0.01)
-    peso_frecuencia = st.slider("Frecuencia", 0.0, 1.0, 0.10, 0.01)
-    peso_pares = st.slider("Pares", 0.0, 1.0, 0.15, 0.01)
-    peso_transiciones = st.slider("Transiciones", 0.0, 1.0, 0.15, 0.01)
-    peso_ausencia = st.slider("Ausencia", 0.0, 1.0, 0.10, 0.01)
-    peso_ciclo = st.slider("Ciclo del número", 0.0, 1.0, 0.10, 0.01)
-    peso_repeticion = st.slider("Repetición", 0.0, 1.0, 0.03, 0.01)
-    peso_espejo = st.slider("Espejo", 0.0, 1.0, 0.02, 0.01)
-    peso_similitud = st.slider("Similitud simple con último", 0.0, 1.0, 0.01, 0.01)
-    peso_influencia = st.slider("Influencia aprendida del último", 0.0, 1.0, 0.20, 0.01)
-    peso_delta = st.slider("Patrón de cambio por posición", 0.0, 1.0, 0.10, 0.01)
-    peso_coincidencias = st.slider("Posiciones conservadas", 0.0, 1.0, 0.05, 0.01)
-    peso_suma = st.slider("Equilibrio de suma", 0.0, 1.0, 0.04, 0.01)
-    peso_paridad = st.slider("Paridad", 0.0, 1.0, 0.03, 0.01)
-
-pesos = {
-    "Posición": peso_posicion,
-    "Frecuencia": peso_frecuencia,
-    "Pares": peso_pares,
-    "Transiciones": peso_transiciones,
-    "Ausencia": peso_ausencia,
-    "Ciclo": peso_ciclo,
-    "Repetición": peso_repeticion,
-    "Espejo": peso_espejo,
-    "Similitud último": peso_similitud,
-    "Influencia último": peso_influencia,
-    "Patrón delta": peso_delta,
-    "Coincidencias históricas": peso_coincidencias,
-    "Suma": peso_suma,
-    "Paridad": peso_paridad,
-}
-
-with tab_ranking:
+with tab_prediccion:
     c1, c2, c3 = st.columns(3)
     sorteo = c1.selectbox("Sorteo", SORTEOS)
     lado = c2.selectbox("Directa 4", ["Últimos 4", "Primeros 4"])
-    top_n = c3.slider("Cantidad de candidatos", 10, 100, 30, 10)
+    top_n = c3.slider("Candidatos mostrados", 10, 100, 30, 10)
 
-    c4, c5, c6 = st.columns(3)
-    ventana = c4.slider("Ventana reciente", 20, 500, 150, 10)
-    recencia = c5.slider("Peso de recencia", 0.0, 3.0, 1.5, 0.1)
-    excluir = c6.checkbox("Excluir números ya vistos", value=False)
-
-    f1, f2, f3 = st.columns(3)
-    usar_filtro = f1.checkbox("Usar filtro inteligente", value=True)
-    ventana_perfil = f2.slider("Ventana del perfil", 50, 500, 200, 25)
-    supervivencia = f3.slider(
-        "Porcentaje que sobrevive",
-        1,
-        20,
-        5,
-        1,
-        help="5% equivale a aproximadamente 500 candidatos antes del ranking final.",
+    filtrados = (
+        datos[datos["sorteo"] == sorteo]
+        .sort_values("fecha")
+        .reset_index(drop=True)
     )
-
-    filtrados = datos[datos["sorteo"] == sorteo].sort_values("fecha")
     numeros = preparar_directa4(filtrados, lado)
 
-    ranking = calcular_ranking(
-        numeros,
-        top_n=top_n,
-        ventana_reciente=ventana,
-        peso_recencia=recencia,
-        pesos=pesos,
-        excluir_vistos=excluir,
-        usar_filtro_perfil=usar_filtro,
-        ventana_perfil=ventana_perfil,
-        porcentaje_supervivencia=supervivencia,
-    )
+    if st.button(
+        "🧠 Entrenar IA y generar ranking",
+        type="primary",
+        use_container_width=True,
+    ):
+        with st.spinner("Entrenando cuatro modelos Random Forest..."):
+            inicio = time.time()
+            modelos = crear_modelos(
+                numeros,
+                lags=lags,
+                max_entrenamiento=max_entrenamiento,
+                arboles=arboles,
+                profundidad=profundidad,
+            )
+            probabilidades = probabilidades_posicion(
+                modelos,
+                numeros,
+                lags,
+            )
+            ranking = ranking_combinaciones(
+                probabilidades,
+                top_n=top_n,
+            )
+            duracion = time.time() - inicio
 
-    if not ranking.empty:
+        st.session_state["ranking_ai"] = ranking
+        st.session_state["probs_ai"] = probabilidades
+        st.session_state["tiempo_ai"] = duracion
+
+    if "ranking_ai" in st.session_state:
+        ranking = st.session_state["ranking_ai"]
         mejor = ranking.iloc[0]
 
-        r1, r2, r3 = st.columns(3)
-        r1.metric("Mejor clasificado", mejor["Número"])
-        r2.metric("Puntuación interna", f'{mejor["Puntuación"]:.2f}')
-        r3.metric("Resultados analizados", f"{len(numeros):,}")
+        p1, p2, p3 = st.columns(3)
+        p1.metric("Mejor clasificado", mejor["Número"])
+        p2.metric("Score IA", f'{mejor["Score IA"]:.4f}')
+        p3.metric(
+            "Tiempo de entrenamiento",
+            f'{st.session_state.get("tiempo_ai", 0):.1f} s',
+        )
 
         st.dataframe(
             ranking,
@@ -672,14 +405,23 @@ with tab_ranking:
         )
 
         st.download_button(
-            "Descargar ranking CSV",
+            "Descargar ranking IA",
             ranking.to_csv(index=False).encode("utf-8-sig"),
-            file_name="ranking_v7.csv",
+            file_name="ranking_tris_ai.csv",
             mime="text/csv",
         )
 
+        st.info(
+            "El Score IA no es una probabilidad garantizada. Es una puntuación "
+            "derivada de las probabilidades estimadas para cada posición."
+        )
+
 with tab_backtest:
-    st.subheader("Validación histórica")
+    st.subheader("Validación temporal de la IA")
+    st.write(
+        "Para cada prueba, el modelo solo ve resultados anteriores. "
+        "Después se comprueba si el resultado real quedó en el Top 100."
+    )
 
     b1, b2, b3 = st.columns(3)
     sorteo_bt = b1.selectbox("Sorteo", SORTEOS, key="bt_sorteo")
@@ -688,51 +430,17 @@ with tab_backtest:
         ["Últimos 4", "Primeros 4"],
         key="bt_lado",
     )
-    pruebas = b3.slider("Sorteos a probar", 10, 100, 30, 10)
-
-    b4, b5 = st.columns(2)
-    ventana_bt = b4.slider(
-        "Ventana reciente",
-        20,
-        500,
-        150,
-        10,
-        key="bt_ventana",
-    )
-    recencia_bt = b5.slider(
-        "Peso de recencia",
-        0.0,
-        3.0,
-        1.5,
-        0.1,
-        key="bt_recencia",
-    )
-
-    bf1, bf2, bf3 = st.columns(3)
-    usar_filtro_bt = bf1.checkbox(
-        "Usar filtro inteligente",
-        value=True,
-        key="bt_usar_filtro",
-    )
-    ventana_perfil_bt = bf2.slider(
-        "Ventana del perfil",
-        50,
-        500,
-        200,
-        25,
-        key="bt_ventana_perfil",
-    )
-    supervivencia_bt = bf3.slider(
-        "Porcentaje que sobrevive",
-        1,
-        20,
+    pruebas = b3.slider(
+        "Sorteos a probar",
         5,
-        1,
-        key="bt_supervivencia",
+        30,
+        10,
+        5,
+        help="Random Forest tarda más. Empieza con 10.",
     )
 
     if st.button(
-        "▶ Ejecutar backtesting",
+        "▶ Ejecutar backtesting IA",
         type="primary",
         use_container_width=True,
     ):
@@ -741,28 +449,27 @@ with tab_backtest:
             .sort_values("fecha")
             .reset_index(drop=True)
         )
-
         numeros_bt = preparar_directa4(filtrados_bt, lado_bt)
         fechas_bt = filtrados_bt["fecha"].tolist()
 
-        if len(numeros_bt) < pruebas + 200:
-            st.error("No hay suficientes resultados.")
+        if len(numeros_bt) < max(300, pruebas + lags + 50):
+            st.error("No hay suficientes resultados para entrenar.")
         else:
+            inicio = time.time()
             resultado = ejecutar_backtesting(
                 numeros_bt,
                 fechas_bt,
                 pruebas,
-                ventana_bt,
-                recencia_bt,
-                pesos,
-                usar_filtro_bt,
-                ventana_perfil_bt,
-                supervivencia_bt,
+                lags,
+                max_entrenamiento,
+                arboles,
+                profundidad,
             )
-            st.session_state["bt_v7"] = resultado
+            st.session_state["bt_ai"] = resultado
+            st.session_state["bt_ai_tiempo"] = time.time() - inicio
 
-    if "bt_v7" in st.session_state:
-        resultado = st.session_state["bt_v7"]
+    if "bt_ai" in st.session_state:
+        resultado = st.session_state["bt_ai"]
         total = len(resultado)
 
         a10 = int(resultado["Top 10"].sum())
@@ -776,10 +483,19 @@ with tab_backtest:
         q3.metric("Top 50", f"{a50}/{total}", f"{a50 / total * 100:.1f}%")
         q4.metric("Top 100", f"{a100}/{total}", f"{a100 / total * 100:.1f}%")
 
+        st.caption(
+            f'Tiempo total: {st.session_state.get("bt_ai_tiempo", 0):.1f} segundos. '
+            "La referencia aleatoria para Top 100 es aproximadamente 1%."
+        )
+
         if a100 / total > 0.01:
-            st.success("El Top 100 superó la referencia aleatoria del 1% en esta muestra.")
+            st.success(
+                "En esta muestra, la IA superó la referencia aleatoria del 1%."
+            )
         else:
-            st.warning("El Top 100 no superó la referencia aleatoria del 1%.")
+            st.warning(
+                "En esta muestra, la IA no superó la referencia aleatoria del 1%."
+            )
 
         st.dataframe(
             resultado.sort_values("Fecha", ascending=False),
@@ -788,101 +504,28 @@ with tab_backtest:
         )
 
         st.download_button(
-            "Descargar backtesting CSV",
+            "Descargar backtesting IA",
             resultado.to_csv(index=False).encode("utf-8-sig"),
-            file_name="backtesting_v7.csv",
+            file_name="backtesting_tris_ai.csv",
             mime="text/csv",
         )
 
-
-with tab_perfil:
-    st.subheader("Perfil histórico reciente")
-
-    p1, p2 = st.columns(2)
-    sorteo_perfil = p1.selectbox(
-        "Sorteo",
-        SORTEOS,
-        key="perfil_sorteo",
+with tab_modelo:
+    st.subheader("Cómo funciona")
+    st.write(
+        "Se entrenan cuatro Random Forest independientes: uno para cada "
+        "posición de Directa 4. Cada modelo recibe los últimos sorteos, "
+        "sus dígitos, sumas, paridad, repeticiones y cambios entre posiciones."
     )
-    lado_perfil = p2.selectbox(
-        "Directa 4",
-        ["Últimos 4", "Primeros 4"],
-        key="perfil_lado",
+    st.write(
+        "Después calcula 10 probabilidades por posición y combina las cuatro "
+        "para ordenar las 10,000 combinaciones posibles."
     )
-
-    p3, p4 = st.columns(2)
-    ventana_perfil_tab = p3.slider(
-        "Resultados usados para aprender el perfil",
-        50,
-        500,
-        200,
-        25,
-        key="perfil_ventana",
+    st.warning(
+        "Un sorteo bien diseñado debe comportarse como un proceso aleatorio. "
+        "El aprendizaje automático puede encontrar correlaciones históricas, "
+        "pero no garantiza que se repitan."
     )
-    mostrar_perfiles = p4.slider(
-        "Cantidad de perfiles probables",
-        5,
-        30,
-        10,
-        5,
-    )
-
-    filtrados_perfil = (
-        datos[datos["sorteo"] == sorteo_perfil]
-        .sort_values("fecha")
-    )
-    numeros_perfil = preparar_directa4(
-        filtrados_perfil,
-        lado_perfil,
-    )
-
-    modelo_perfil = aprender_perfil(
-        numeros_perfil,
-        ventana_perfil=ventana_perfil_tab,
-    )
-
-    perfiles_posibles = []
-    for pares in range(5):
-        for repetidos in range(4):
-            for altos in range(5):
-                score = (
-                    0.4 * modelo_perfil["pares"].get(pares, 0)
-                    + 0.35 * modelo_perfil["repetidos"].get(repetidos, 0)
-                    + 0.25 * modelo_perfil["altos"].get(altos, 0)
-                )
-                perfiles_posibles.append(
-                    {
-                        "Pares": pares,
-                        "Impares": 4 - pares,
-                        "Repetidos": repetidos,
-                        "Dígitos altos": altos,
-                        "Dígitos bajos": 4 - altos,
-                        "Score": round(score * 100, 2),
-                    }
-                )
-
-    perfiles_df = (
-        pd.DataFrame(perfiles_posibles)
-        .sort_values("Score", ascending=False)
-        .head(mostrar_perfiles)
-        .reset_index(drop=True)
-    )
-    perfiles_df.insert(0, "Ranking", range(1, len(perfiles_df) + 1))
-
-    st.dataframe(
-        perfiles_df,
-        use_container_width=True,
-        hide_index=True,
-    )
-
-    m1, m2, m3 = st.columns(3)
-    m1.metric("Suma promedio", f'{modelo_perfil["suma_media"]:.1f}')
-    m2.metric("Desviación de suma", f'{modelo_perfil["suma_std"]:.1f}')
-    m3.metric(
-        "Probabilidad histórica de iniciar con 0",
-        f'{modelo_perfil["prob_cero"] * 100:.1f}%',
-    )
-
 
 with tab_base:
     st.dataframe(
